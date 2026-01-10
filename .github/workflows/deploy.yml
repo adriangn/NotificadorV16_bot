@@ -1,0 +1,74 @@
+name: deploy
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          version: "1.118.0"
+
+      - name: Build
+        run: sam build --use-container
+
+      - name: Deploy
+        run: >
+          sam deploy
+          --no-confirm-changeset
+          --no-fail-on-empty-changeset
+          --resolve-s3
+          --capabilities CAPABILITY_IAM
+          --stack-name notificadorv16-bot
+          --parameter-overrides
+          TelegramToken=${{ secrets.TELEGRAM_TOKEN }}
+          TelegramWebhookSecret=${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+
+      - name: Get HttpApiUrl output
+        id: stack
+        run: |
+          set -euo pipefail
+          API_URL=$(aws cloudformation describe-stacks --stack-name notificadorv16-bot --query "Stacks[0].Outputs[?OutputKey=='HttpApiUrl'].OutputValue" --output text)
+          if [ -z "${API_URL}" ] || [ "${API_URL}" = "None" ]; then
+            echo "Error: CloudFormation output 'HttpApiUrl' not found or empty for stack 'notificadorv16-bot'." >&2
+            exit 1
+          fi
+          echo "api_url=${API_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Telegram webhook
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          API_URL: ${{ steps.stack.outputs.api_url }}
+        run: |
+          set -euo pipefail
+          WEBHOOK_URL="${API_URL}/webhook"
+          RESP=$(curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook" \
+            -d "url=${WEBHOOK_URL}" \
+            -d "secret_token=${TELEGRAM_WEBHOOK_SECRET}" \
+            -d "drop_pending_updates=true")
+          echo "$RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("ok") is True, d'
+

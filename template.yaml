@@ -1,0 +1,48 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Telegram bot on AWS Lambda (Webhook) - NotificadorV16_bot
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 128
+    Tracing: Active
+    Environment:
+      Variables:
+        TELEGRAM_API_BASE: https://api.telegram.org
+
+Resources:
+  TelegramBotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.lambda_handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+      Environment:
+        Variables:
+          TELEGRAM_TOKEN: !Ref TelegramToken
+          TELEGRAM_WEBHOOK_SECRET: !Ref TelegramWebhookSecret
+      Events:
+        Webhook:
+          Type: HttpApi
+          Properties:
+            Path: /webhook
+            Method: POST
+
+Parameters:
+  TelegramToken:
+    Type: String
+    NoEcho: true
+    Description: Telegram bot token (from BotFather)
+  TelegramWebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: Secret token used to validate X-Telegram-Bot-Api-Secret-Token header
+
+Outputs:
+  HttpApiUrl:
+    Description: Base URL for the HTTP API
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+
