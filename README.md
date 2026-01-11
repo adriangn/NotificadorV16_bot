@@ -7,6 +7,7 @@ This repository contains a **Telegram bot** designed to run on **AWS Lambda**.
 - The bot logic is intended to be deployed as an AWS Lambda function.
 - It uses a Telegram Bot token to authenticate against the Telegram Bot API.
 - Deployment is expected to be automated using GitHub repository secrets (see below).
+- It manages Telegram **chat** subscriptions to municipalities (future: notify about roadside assistance beacons).
 
 ## GitHub Secrets
 
@@ -17,6 +18,23 @@ This repository expects the following GitHub Actions secrets to be configured:
 - **AWS_REGION**: AWS region where the Lambda function is deployed (e.g. `us-east-1`).
 - **TELEGRAM_TOKEN**: Telegram Bot token (from BotFather).
 - **TELEGRAM_WEBHOOK_SECRET**: Secret token used to validate incoming webhook requests via the `X-Telegram-Bot-Api-Secret-Token` header.
+
+## Bot commands
+
+- `/start`: Show the main menu (subscribe / list / unsubscribe).
+- `/suscribir`: Start municipality search flow.
+- `/mis_suscripciones`: List current chat subscriptions.
+- `/anular`: Unsubscribe flow (inline button selection).
+
+## Data (municipalities)
+
+The searchable municipality dataset is shipped as `src/data/municipalities.json` (UTF-8).
+
+To rebuild it from the official CSV sources under `.context/`:
+
+```bash
+python3 scripts/build_municipalities.py
+```
 
 ## Notes
 

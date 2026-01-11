@@ -11,6 +11,7 @@ Globals:
     Environment:
       Variables:
         TELEGRAM_API_BASE: https://api.telegram.org
+        MAX_SUBSCRIPTIONS: "50"
 
 Resources:
   TelegramBotFunction:
@@ -20,16 +21,50 @@ Resources:
       Handler: app.lambda_handler
       Policies:
         - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubscriptionsTable
       Environment:
         Variables:
           TELEGRAM_TOKEN: !Ref TelegramToken
           TELEGRAM_WEBHOOK_SECRET: !Ref TelegramWebhookSecret
+          SUBSCRIPTIONS_TABLE: !Ref SubscriptionsTable
       Events:
         Webhook:
           Type: HttpApi
           Properties:
             Path: /webhook
             Method: POST
+
+  SubscriptionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: KEYS_ONLY
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
 
 Parameters:
   TelegramToken:
@@ -45,4 +80,8 @@ Outputs:
   HttpApiUrl:
     Description: Base URL for the HTTP API
     Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  SubscriptionsTableName:
+    Description: DynamoDB table for chat subscriptions
+    Value: !Ref SubscriptionsTable
 
