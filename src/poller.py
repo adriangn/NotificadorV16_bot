@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import hmac
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -164,6 +166,9 @@ def _iter_v16_events(xml_bytes: bytes) -> Iterable[dict[str, Any]]:
             namespaces=NS,
         )
 
+        lat = rec.findtext(".//loc:pointCoordinates/loc:latitude", default="", namespaces=NS)
+        lon = rec.findtext(".//loc:pointCoordinates/loc:longitude", default="", namespaces=NS)
+
         # Spanish extension provides municipality/province inside loc:extendedTpegNonJunctionPoint
         municipality = rec.findtext(
             ".//loc:extendedTpegNonJunctionPoint/lse:municipality", default="", namespaces=NS
@@ -188,6 +193,8 @@ def _iter_v16_events(xml_bytes: bytes) -> Iterable[dict[str, Any]]:
             "road": road,
             "km": km,
             "start_time": start_time,
+            "lat": lat,
+            "lon": lon,
         }
 
 
@@ -270,14 +277,26 @@ def _format_message(ev: dict[str, Any]) -> str:
     road = ev.get("road", "")
     km = ev.get("km", "")
     start_time = ev.get("start_time", "")
+    lat = (ev.get("lat", "") or "").strip()
+    lon = (ev.get("lon", "") or "").strip()
     if mun or prov:
         parts.append(f"📍 {mun} ({prov})".strip())
-    if road:
+    if road and km:
+        parts.append(f"🛣️ {road} — km {km}")
+    elif road:
         parts.append(f"🛣️ {road}")
-    if km:
+    elif km:
         parts.append(f"📌 km {km}")
+
     if start_time:
-        parts.append(f"🕒 {start_time}")
+        try:
+            dt = datetime.fromisoformat(start_time.replace("Z", "+00:00")).astimezone(ZoneInfo("Europe/Madrid"))
+            parts.append(f"🕒 Desde: {dt.strftime('%d/%m/%Y %H:%M')} (hora local)")
+        except Exception:
+            parts.append(f"🕒 Desde: {start_time}")
+
+    if lat and lon:
+        parts.append(f"🗺️ Mapa: https://www.google.com/maps?q={lat},{lon}")
     return "\n".join(parts)
 
 
