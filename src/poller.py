@@ -31,6 +31,7 @@ DGT_XML_URL = os.environ.get(
 # Dedup window: how long we keep "sent" markers (seconds).
 NOTIFY_TTL_SECONDS = int(os.environ.get("NOTIFY_TTL_SECONDS", str(60 * 60 * 24)))
 METRICS_NAMESPACE = os.environ.get("METRICS_NAMESPACE", "NotificadorV16Bot")
+POLLER_LOCK_TTL_SECONDS = int(os.environ.get("POLLER_LOCK_TTL_SECONDS", "55"))
 
 
 NS = {
@@ -348,6 +349,32 @@ def _dedupe_mark_sent(record_id: str, chat_id: int) -> bool:
         return False
 
 
+def _acquire_poller_lock() -> bool:
+    """
+    Prevent overlapping poller runs without using ReservedConcurrentExecutions.
+    Uses a DynamoDB conditional put with TTL.
+    """
+    table = _get_ddb_table()
+    now = int(time.time())
+    pk = "LOCK#PollerFunction"
+    sk = "RUN"
+    try:
+        table.put_item(
+            Item={"PK": pk, "SK": sk, "ttl": now + POLLER_LOCK_TTL_SECONDS, "created_at": now},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except Exception as e:
+        try:
+            code = e.response.get("Error", {}).get("Code")  # type: ignore[attr-defined]
+        except Exception:
+            code = None
+        if code == "ConditionalCheckFailedException":
+            return False
+        logger.warning("Lock put failed: %s", e)
+        return False
+
+
 def _format_message(ev: dict[str, Any]) -> str:
     parts = ["🚨 Baliza V16 activa"]
     mun = ev.get("municipality", "")
@@ -401,6 +428,11 @@ def _event_dedupe_key(ev: dict[str, Any]) -> str:
 
 def lambda_handler(event, context):
     try:
+        if not _acquire_poller_lock():
+            logger.info("Skipping run: lock held")
+            _emit_metrics(poller_lock_skipped=1)
+            return {"ok": True, "skipped": True}
+
         xml_bytes = _fetch_dgt_xml()
         events = list(_iter_v16_events(xml_bytes))
         logger.info("Fetched %d V16-like events", len(events))
