@@ -35,6 +35,12 @@ Resources:
             Path: /webhook
             Method: POST
 
+  TelegramBotLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${TelegramBotFunction}"
+      RetentionInDays: 90
+
   PollerFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -59,6 +65,12 @@ Resources:
           Properties:
             Schedule: rate(1 minute)
             Enabled: true
+
+  PollerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${PollerFunction}"
+      RetentionInDays: 90
 
   SubscriptionsTable:
     Type: AWS::DynamoDB::Table
