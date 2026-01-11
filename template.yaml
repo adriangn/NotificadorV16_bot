@@ -35,6 +35,29 @@ Resources:
             Path: /webhook
             Method: POST
 
+  PollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: poller.lambda_handler
+      Timeout: 25
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubscriptionsTable
+      Environment:
+        Variables:
+          TELEGRAM_TOKEN: !Ref TelegramToken
+          SUBSCRIPTIONS_TABLE: !Ref SubscriptionsTable
+          DGT_XML_URL: https://nap.dgt.es/datex2/v3/dgt/SituationPublication/datex2_v36.xml
+          NOTIFY_TTL_SECONDS: "86400"
+      Events:
+        EveryMinute:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Enabled: true
+
   SubscriptionsTable:
     Type: AWS::DynamoDB::Table
     Properties:

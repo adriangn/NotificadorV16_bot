@@ -49,3 +49,15 @@ This project is deployed using **AWS SAM** via GitHub Actions (`.github/workflow
 - After deploy, it configures the Telegram webhook to point to:
   - `${HttpApiUrl}/webhook`
   - and sets `secret_token` to `TELEGRAM_WEBHOOK_SECRET`.
+
+## DGT feed polling (V16)
+
+A scheduled Lambda (`PollerFunction`) runs **every minute** and fetches the DATEX2 SituationPublication feed from DGT:
+
+- `https://nap.dgt.es/datex2/v3/dgt/SituationPublication/datex2_v36.xml`
+
+It extracts V16-like records (GenericSituationRecord with `vehicleObstruction/vehicleStuck` and Spanish location extension fields: municipality + province) and notifies all chats subscribed to the matching municipality.
+
+### Deduplication
+
+The same V16 beacon can appear in multiple consecutive XML snapshots. To avoid spamming, the poller stores a "sent" marker in DynamoDB per `(record_id, chat_id)` with a TTL (`NOTIFY_TTL_SECONDS`, default 24h).
