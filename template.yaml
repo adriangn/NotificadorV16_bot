@@ -41,6 +41,7 @@ Resources:
       CodeUri: src/
       Handler: poller.lambda_handler
       Timeout: 25
+      ReservedConcurrentExecutions: 1
       Policies:
         - AWSLambdaBasicExecutionRole
         - DynamoDBCrudPolicy:
@@ -51,6 +52,7 @@ Resources:
           SUBSCRIPTIONS_TABLE: !Ref SubscriptionsTable
           DGT_XML_URL: https://nap.dgt.es/datex2/v3/dgt/SituationPublication/datex2_v36.xml
           NOTIFY_TTL_SECONDS: "86400"
+          METRICS_NAMESPACE: NotificadorV16Bot
       Events:
         EveryMinute:
           Type: Schedule

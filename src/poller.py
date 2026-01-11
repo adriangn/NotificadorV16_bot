@@ -11,6 +11,9 @@ from typing import Any, Iterable
 import hmac
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import hashlib
+import random
+import urllib.error
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -27,6 +30,7 @@ DGT_XML_URL = os.environ.get(
 
 # Dedup window: how long we keep "sent" markers (seconds).
 NOTIFY_TTL_SECONDS = int(os.environ.get("NOTIFY_TTL_SECONDS", str(60 * 60 * 24)))
+METRICS_NAMESPACE = os.environ.get("METRICS_NAMESPACE", "NotificadorV16Bot")
 
 
 NS = {
@@ -126,11 +130,83 @@ def _telegram_api(method: str, payload: dict) -> dict:
         raw = resp.read().decode("utf-8")
         return json.loads(raw) if raw else {}
 
+def _emit_metrics(**values: int) -> None:
+    """
+    Emit CloudWatch metrics using Embedded Metric Format (EMF) via logs.
+    """
+    ts = int(time.time() * 1000)
+    metric_defs = [{"Name": k, "Unit": "Count"} for k in values.keys()]
+    doc = {
+        "_aws": {
+            "Timestamp": ts,
+            "CloudWatchMetrics": [
+                {
+                    "Namespace": METRICS_NAMESPACE,
+                    "Dimensions": [["Service"]],
+                    "Metrics": metric_defs,
+                }
+            ],
+        },
+        "Service": "PollerFunction",
+        **values,
+    }
+    # CloudWatch automatically extracts EMF metrics from logs.
+    print(json.dumps(doc))
+
+
+def _retry(fn, *, tries: int, base_delay: float, max_delay: float, jitter: float = 0.2):
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i == tries - 1:
+                break
+            delay = min(max_delay, base_delay * (2**i))
+            delay = delay * (1.0 + random.uniform(-jitter, jitter))
+            time.sleep(max(0.0, delay))
+    raise last  # type: ignore[misc]
+
+
+def _telegram_send_message(chat_id: int, text: str) -> None:
+    """
+    Send message with basic retry/backoff for common transient failures.
+    """
+
+    def _do():
+        return _telegram_api("sendMessage", {"chat_id": chat_id, "text": text})
+
+    def _wrapped():
+        try:
+            return _do()
+        except urllib.error.HTTPError as e:
+            code = getattr(e, "code", None)
+            # Handle rate limit (429) with Retry-After header when available.
+            if code == 429:
+                ra = e.headers.get("Retry-After") if getattr(e, "headers", None) else None
+                try:
+                    wait = float(ra) if ra else 1.0
+                except Exception:
+                    wait = 1.0
+                time.sleep(min(5.0, max(0.5, wait)))
+                raise
+            # Retry 5xx
+            if code and 500 <= int(code) < 600:
+                raise
+            # Non-retryable
+            raise
+
+    _retry(_wrapped, tries=3, base_delay=0.5, max_delay=3.0)
+
 
 def _fetch_dgt_xml() -> bytes:
-    req = urllib.request.Request(DGT_XML_URL, method="GET")
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return resp.read()
+    def _do():
+        req = urllib.request.Request(DGT_XML_URL, method="GET")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read()
+
+    return _retry(_do, tries=3, base_delay=0.8, max_delay=5.0)
 
 
 def _iter_v16_events(xml_bytes: bytes) -> Iterable[dict[str, Any]]:
@@ -180,6 +256,7 @@ def _iter_v16_events(xml_bytes: bytes) -> Iterable[dict[str, Any]]:
             ".//loc:extendedTpegNonJunctionPoint/lse:kilometerPoint", default="", namespaces=NS
         )
         start_time = rec.findtext("./sit:validity/com:validityTimeSpecification/com:overallStartTime", default="", namespaces=NS)
+        creation_ref = rec.findtext("./sit:situationRecordCreationReference", default="", namespaces=NS)
 
         record_id = rec.attrib.get("id") or situation_id or ""
         if not (record_id and municipality and province):
@@ -188,6 +265,7 @@ def _iter_v16_events(xml_bytes: bytes) -> Iterable[dict[str, Any]]:
         yield {
             "record_id": record_id,
             "situation_id": situation_id or "",
+            "creation_ref": creation_ref,
             "municipality": municipality,
             "province": province,
             "road": road,
@@ -300,30 +378,78 @@ def _format_message(ev: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _event_dedupe_key(ev: dict[str, Any]) -> str:
+    """
+    Build a stable dedupe key. Prefer creation_ref when available and hash stable fields.
+    """
+    creation_ref = (ev.get("creation_ref") or "").strip()
+    base = creation_ref or (ev.get("situation_id") or "") or (ev.get("record_id") or "")
+    stable = "|".join(
+        [
+            base,
+            (ev.get("province") or ""),
+            (ev.get("municipality") or ""),
+            (ev.get("road") or ""),
+            (ev.get("km") or ""),
+            (ev.get("start_time") or ""),
+            (ev.get("lat") or ""),
+            (ev.get("lon") or ""),
+        ]
+    )
+    return hashlib.sha1(stable.encode("utf-8")).hexdigest()[:20]
+
+
 def lambda_handler(event, context):
     try:
         xml_bytes = _fetch_dgt_xml()
         events = list(_iter_v16_events(xml_bytes))
         logger.info("Fetched %d V16-like events", len(events))
 
+        parsed = len(events)
+        mapped = 0
+        unmapped = 0
         sent = 0
+        telegram_errors = 0
+        ddb_errors = 0
+
         for ev in events:
             mid = _municipality_id_from_names(ev["municipality"], ev["province"])
             if not mid:
+                unmapped += 1
                 continue
+            mapped += 1
             chat_ids = _query_subscribed_chats(mid)
             if not chat_ids:
                 continue
             text = _format_message(ev)
-            record_id = ev["record_id"]
+            record_id = _event_dedupe_key(ev)
             for chat_id in chat_ids:
-                if not _dedupe_mark_sent(record_id, chat_id):
+                try:
+                    if not _dedupe_mark_sent(record_id, chat_id):
+                        continue
+                except Exception:
+                    ddb_errors += 1
                     continue
-                _telegram_api("sendMessage", {"chat_id": chat_id, "text": text})
-                sent += 1
+                try:
+                    _telegram_send_message(chat_id, text)
+                    sent += 1
+                except Exception:
+                    telegram_errors += 1
+                    # Don't abort the batch.
+                    continue
+
+        _emit_metrics(
+            events_parsed=parsed,
+            events_mapped=mapped,
+            events_unmapped=unmapped,
+            notifications_sent=sent,
+            telegram_errors=telegram_errors,
+            ddb_errors=ddb_errors,
+        )
 
         return {"ok": True, "sent": sent, "events": len(events)}
     except Exception:
         logger.exception("Poller error")
+        _emit_metrics(poller_errors=1)
         return {"ok": False}
 

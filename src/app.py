@@ -217,9 +217,18 @@ def _subscribe(chat_id: int, mun_id: str) -> tuple[bool, str]:
         "created_at": now,
     }
 
-    # PutItem without condition is idempotent enough for our case.
-    table.put_item(Item=item)
-    return True, f"Suscrito a: {m.get('name')} ({m.get('province_name')})"
+    try:
+        table.put_item(Item=item, ConditionExpression="attribute_not_exists(PK)")
+        return True, f"Suscrito a: {m.get('name')} ({m.get('province_name')})"
+    except Exception as e:
+        # Already subscribed
+        try:
+            code = e.response.get("Error", {}).get("Code")  # type: ignore[attr-defined]
+        except Exception:
+            code = None
+        if code == "ConditionalCheckFailedException":
+            return True, f"Ya estabas suscrito a: {m.get('name')} ({m.get('province_name')})"
+        raise
 
 
 def _unsubscribe(chat_id: int, mun_id: str) -> tuple[bool, str]:
@@ -240,12 +249,17 @@ def _send_menu(chat_id: int) -> None:
         "sendMessage",
         {
             "chat_id": chat_id,
-            "text": "Gestiona tus suscripciones por municipio:",
+            "text": (
+                "📌 *NotificadorV16* — Suscripciones por municipio\n\n"
+                "Este chat puede suscribirse a *hasta 50 municipios* para recibir avisos.\n"
+                "Elige una opción:"
+            ),
+            "parse_mode": "Markdown",
             "reply_markup": _kbd(
                 [
-                    [{"text": "Suscribirme", "callback_data": "m_sub"}],
-                    [{"text": "Mis suscripciones", "callback_data": "m_list"}],
-                    [{"text": "Anular suscripción", "callback_data": "m_unsub"}],
+                    [{"text": "➕ Suscribirme a un municipio", "callback_data": "m_sub"}],
+                    [{"text": "📋 Ver mis suscripciones", "callback_data": "m_list"}],
+                    [{"text": "➖ Anular una suscripción", "callback_data": "m_unsub"}],
                 ]
             ),
         },
@@ -258,31 +272,85 @@ def _send_subscribe_prompt(chat_id: int) -> None:
         "sendMessage",
         {
             "chat_id": chat_id,
-            "text": "Escribe el nombre del municipio para buscarlo (ej: 'Zaragoza').",
+            "text": (
+                "🔎 *Buscar municipio*\n\n"
+                "Escribe el nombre del municipio.\n"
+                "Consejos:\n"
+                "- Puedes escribir también la provincia para afinar (ej: `Toledo Toledo`).\n"
+                "- No hace falta poner tildes.\n\n"
+                "Cuando quieras, escribe /cancelar."
+            ),
+            "parse_mode": "Markdown",
         },
     )
 
 
-def _send_subscriptions_list(chat_id: int) -> None:
+def _send_subscriptions_list(chat_id: int, page: int = 0) -> None:
     subs = _get_subscriptions(chat_id)
     if not subs:
-        _telegram_api("sendMessage", {"chat_id": chat_id, "text": "No hay suscripciones en este chat."})
+        _telegram_api(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": (
+                    "📭 *Sin suscripciones*\n\n"
+                    "Este chat todavía no está suscrito a ningún municipio.\n"
+                    "Pulsa “Suscribirme” en /start o usa /suscribir."
+                ),
+                "parse_mode": "Markdown",
+            },
+        )
         return
-    lines = ["Suscripciones de este chat:"]
-    for it in subs[:MAX_SUBSCRIPTIONS]:
+    page_size = 15
+    total = len(subs)
+    page = max(0, page)
+    start = page * page_size
+    chunk = subs[start : start + page_size]
+    total_pages = (total + page_size - 1) // page_size
+    page_display = min(page + 1, max(1, total_pages))
+
+    lines = [f"📋 *Suscripciones de este chat* — {total} (página {page_display}/{max(1, total_pages)})"]
+    for it in chunk:
         lines.append(f"- {it.get('municipality_name','')} ({it.get('province_name','')})")
-    _telegram_api("sendMessage", {"chat_id": chat_id, "text": "\n".join(lines)})
+
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append({"text": "⬅️ Anteriores", "callback_data": f"listp:{page-1}"})
+    if start + page_size < total:
+        nav.append({"text": "Siguientes ➡️", "callback_data": f"listp:{page+1}"})
+    if nav:
+        rows.append(nav)
+
+    _telegram_api(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": "\n".join(lines),
+            "parse_mode": "Markdown",
+            **({"reply_markup": _kbd(rows)} if rows else {}),
+        },
+    )
 
 
 def _send_unsubscribe_page(chat_id: int, page: int = 0) -> None:
     subs = _get_subscriptions(chat_id)
     if not subs:
-        _telegram_api("sendMessage", {"chat_id": chat_id, "text": "No hay suscripciones para anular."})
+        _telegram_api(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": "📭 No hay suscripciones para anular en este chat.",
+            },
+        )
         return
 
     page_size = 10
     start = page * page_size
     chunk = subs[start : start + page_size]
+    total = len(subs)
+    total_pages = (total + page_size - 1) // page_size
+    page_display = min(page + 1, max(1, total_pages))
     rows = []
     for it in chunk:
         mun_id = (it.get("municipality_id") or "").replace("MUN#", "")
@@ -296,12 +364,14 @@ def _send_unsubscribe_page(chat_id: int, page: int = 0) -> None:
         nav.append({"text": "Siguientes ➡️", "callback_data": f"unsubp:{page+1}"})
     if nav:
         rows.append(nav)
+    rows.append([{"text": "Cancelar", "callback_data": "m_cancel"}])
 
     _telegram_api(
         "sendMessage",
         {
             "chat_id": chat_id,
-            "text": "Selecciona una suscripción para anular:",
+            "text": f"➖ *Anular suscripción* (página {page_display}/{max(1, total_pages)})\n\nToca una para eliminarla:",
+            "parse_mode": "Markdown",
             "reply_markup": _kbd(rows),
         },
     )
@@ -317,12 +387,27 @@ def _handle_text_message(chat_id: int, text: str) -> None:
         _send_menu(chat_id)
         return
 
+    if t.startswith("/cancelar"):
+        _clear_chat_state(chat_id)
+        _telegram_api("sendMessage", {"chat_id": chat_id, "text": "✅ Operación cancelada."})
+        return
+
     if t.startswith("/help"):
         _telegram_api(
             "sendMessage",
             {
                 "chat_id": chat_id,
-                "text": "Comandos:\n/start\n/suscribir\n/mis_suscripciones\n/anular",
+                "text": (
+                    "ℹ️ *Ayuda*\n\n"
+                    "Comandos:\n"
+                    "- /start — menú principal\n"
+                    "- /suscribir — buscar y añadir un municipio\n"
+                    "- /mis_suscripciones — ver municipios de este chat\n"
+                    "- /anular — eliminar una suscripción\n"
+                    "- /cancelar — cancelar la operación actual\n\n"
+                    "Límite: *50 municipios por chat*."
+                ),
+                "parse_mode": "Markdown",
             },
         )
         return
@@ -333,7 +418,7 @@ def _handle_text_message(chat_id: int, text: str) -> None:
 
     if t.startswith("/mis_suscripciones"):
         _clear_chat_state(chat_id)
-        _send_subscriptions_list(chat_id)
+        _send_subscriptions_list(chat_id, page=0)
         return
 
     if t.startswith("/anular"):
@@ -350,7 +435,14 @@ def _handle_text_message(chat_id: int, text: str) -> None:
                 "sendMessage",
                 {
                     "chat_id": chat_id,
-                    "text": "No he encontrado coincidencias. Prueba con otra búsqueda más específica.",
+                    "text": (
+                        "❌ No he encontrado coincidencias.\n\n"
+                        "Prueba con:\n"
+                        "- Un nombre más completo (ej: `San Pedro`).\n"
+                        "- Añadir la provincia (ej: `Toledo Toledo`).\n"
+                        "- Quitar abreviaturas.\n\n"
+                        "O escribe /cancelar."
+                    ),
                 },
             )
             return
@@ -363,14 +455,20 @@ def _handle_text_message(chat_id: int, text: str) -> None:
             "sendMessage",
             {
                 "chat_id": chat_id,
-                "text": "Resultados (toca para suscribirte):",
-                "reply_markup": _kbd(rows),
+                "text": "✅ Resultados (toca uno para suscribirte):",
+                "reply_markup": _kbd(rows + [[{"text": "Cancelar", "callback_data": "m_cancel"}]]),
             },
         )
         return
 
     # Default (do not spam): show menu hint.
-    _telegram_api("sendMessage", {"chat_id": chat_id, "text": "Usa /start para gestionar suscripciones."})
+    _telegram_api(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": "Usa /start para abrir el menú o /help para ver comandos.",
+        },
+    )
 
 
 def _handle_callback(update: dict) -> None:
@@ -393,12 +491,25 @@ def _handle_callback(update: dict) -> None:
 
     if data == "m_list":
         _clear_chat_state(chat_id)
-        _send_subscriptions_list(chat_id)
+        _send_subscriptions_list(chat_id, page=0)
         return
 
     if data == "m_unsub":
         _clear_chat_state(chat_id)
         _send_unsubscribe_page(chat_id, page=0)
+        return
+
+    if data == "m_cancel":
+        _clear_chat_state(chat_id)
+        _telegram_api("sendMessage", {"chat_id": chat_id, "text": "Operación cancelada."})
+        return
+
+    if data.startswith("listp:"):
+        try:
+            page = int(data.split(":", 1)[1])
+        except Exception:
+            page = 0
+        _send_subscriptions_list(chat_id, page=page)
         return
 
     if data.startswith("unsubp:"):
