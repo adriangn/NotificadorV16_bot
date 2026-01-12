@@ -794,9 +794,9 @@ def lambda_handler(event, context):
             return {"ok": True, "skipped": True}
         lock_acquired = True
 
+        start_ts = time.time()
         xml_bytes = _fetch_dgt_xml()
         events = list(_iter_v16_events(xml_bytes))
-        _log("info", "poller_fetched", run_id=run_id, events=len(events))
 
         parsed = len(events)
         mapped = 0
@@ -954,21 +954,19 @@ def lambda_handler(event, context):
             subscribed_chats=subscribed_chats,
         )
 
+        # Keep a single concise human-readable line; metrics are already in EMF above.
         _log(
             "info",
-            "poller_summary",
+            "poller_run",
             run_id=run_id,
-            parsed=parsed,
-            mapped=mapped,
-            unmapped=unmapped,
-            candidate_chats=candidate_chats,
-            notify_targets=notify_targets,
-            notify_deliverable_targets=notify_deliverable_targets,
+            events=parsed,
             sent=sent,
+            duration_ms=int((time.time() - start_ts) * 1000),
+            # Include only "debuggable" counters (avoid duplicating everything in EMF).
+            unmapped=unmapped,
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
             quiet_skipped=quiet_skipped,
-            subscribed_chats=subscribed_chats,
         )
 
         if unmapped_samples:
