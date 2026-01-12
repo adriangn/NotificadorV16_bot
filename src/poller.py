@@ -773,6 +773,7 @@ def lambda_handler(event, context):
 
         candidate_chats = len(unique_candidate_chats)
         notify_targets = len(to_notify)  # chats with at least one pending event after quiet+dedupe
+        blocked_targets: set[int] = set()
 
         # Send notifications batched per chat
         for chat_id, evs in to_notify.items():
@@ -816,6 +817,7 @@ def lambda_handler(event, context):
                 # If user blocked the bot (or chat is permanently invalid), stop retrying forever:
                 # remove subscriptions and (optionally) chat settings/state.
                 if _is_permanent_telegram_chat_error(details):
+                    blocked_targets.add(chat_id)
                     deleted = _purge_chat_subscriptions(chat_id)
                     if deleted > 0:
                         _metrics_update_subscribed_chats(delta=-1)
@@ -830,6 +832,10 @@ def lambda_handler(event, context):
                     )
                 continue
 
+        # Targets excluding permanent Telegram delivery failures (blocked/chat not found).
+        # This lets alarms focus on "deliverable but not delivered" rather than user blocks.
+        notify_deliverable_targets = max(0, notify_targets - len(blocked_targets))
+
         subscribed_chats = _get_subscribed_chats_metric()
         _emit_metrics(
             events_parsed=parsed,
@@ -838,6 +844,7 @@ def lambda_handler(event, context):
             notifications_sent=sent,
             candidate_chats=candidate_chats,
             notify_targets=notify_targets,
+            notify_deliverable_targets=notify_deliverable_targets,
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
             quiet_skipped=quiet_skipped,
@@ -850,6 +857,7 @@ def lambda_handler(event, context):
             unmapped=unmapped,
             candidate_chats=candidate_chats,
             notify_targets=notify_targets,
+            notify_deliverable_targets=notify_deliverable_targets,
             notifications_sent=sent,
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
@@ -866,6 +874,7 @@ def lambda_handler(event, context):
             unmapped=unmapped,
             candidate_chats=candidate_chats,
             notify_targets=notify_targets,
+            notify_deliverable_targets=notify_deliverable_targets,
             sent=sent,
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,

@@ -176,11 +176,11 @@ Resources:
             Period: 300
             Stat: Sum
           ReturnData: false
-        - Id: mTargets
+        - Id: mDeliverable
           MetricStat:
             Metric:
               Namespace: NotificadorV16Bot
-              MetricName: notify_targets
+              MetricName: notify_deliverable_targets
               Dimensions:
                 - Name: Service
                   Value: PollerFunction
@@ -199,7 +199,7 @@ Resources:
             Stat: Sum
           ReturnData: false
         - Id: e1
-          Expression: IF(mParsed>0 AND mTargets>0 AND mSent==0, 1, 0)
+          Expression: IF(mParsed>0 AND mDeliverable>0 AND mSent==0, 1, 0)
           Label: ParsedButNoSent
           ReturnData: true
       AlarmActions:
