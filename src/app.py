@@ -398,6 +398,12 @@ def _set_chat_settings(chat_id: int, updates: dict[str, Any]) -> None:
         **updates,
     }
     table.put_item(Item=item)
+    # Migration/operational convenience: keep legacy SubscriptionsTable SETTINGS in sync
+    # so that operators don't see conflicting values across tables.
+    try:
+        _get_ddb_table().put_item(Item=item)
+    except Exception:
+        pass
 
 
 def _fmt_quiet(settings: dict[str, Any]) -> str:
@@ -609,7 +615,7 @@ def _handle_text_message(chat_id: int, text: str) -> None:
         # /silencio HH:MM HH:MM
         parts = t.split()
         if len(parts) == 2 and parts[1].lower() in ("off", "no", "false", "0"):
-            _set_chat_settings(chat_id, {"quiet_enabled": False})
+            _set_chat_settings(chat_id, {"quiet_enabled": False, "quiet_mode": "window"})
             _telegram_api("sendMessage", {"chat_id": chat_id, "text": "🔔 Modo silencio desactivado."})
             return
         if len(parts) == 2 and parts[1].lower() in ("on", "si", "sí", "true", "1", "always"):
@@ -781,7 +787,7 @@ def _handle_callback(update: dict) -> None:
         return
 
     if data == "quiet:off":
-        _set_chat_settings(chat_id, {"quiet_enabled": False})
+        _set_chat_settings(chat_id, {"quiet_enabled": False, "quiet_mode": "window"})
         _telegram_api("sendMessage", {"chat_id": chat_id, "text": "🔔 Modo silencio desactivado."})
         return
 
