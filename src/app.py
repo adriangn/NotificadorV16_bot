@@ -187,7 +187,8 @@ def _metrics_update_subscribed_chats(delta: int) -> None:
             table.update_item(
                 Key={"PK": "METRIC#subscriptions", "SK": "COUNTERS"},
                 UpdateExpression="ADD subscribed_chats :d SET updated_at = :now",
-                ConditionExpression="attribute_not_exists(subscribed_chats) OR subscribed_chats > :z",
+                # Only decrement if the counter exists and is > 0 (avoid creating negative values).
+                ConditionExpression="subscribed_chats > :z",
                 ExpressionAttributeValues={":d": delta, ":now": now, ":z": 0},
             )
         else:
