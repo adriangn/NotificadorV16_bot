@@ -464,28 +464,39 @@ def _format_message(ev: dict[str, Any]) -> str:
 
     if lat and lon:
         parts.append(f"🗺️ Mapa: https://www.google.com/maps?q={lat},{lon}")
+
+    # Traceability: helps understand whether repeated notifications are the same or different DGT records.
+    sid = (ev.get("situation_id") or "").strip()
+    rid = (ev.get("record_id") or "").strip()
+    if sid or rid:
+        parts.append(f"🆔 DGT: situation={sid or '-'} record={rid or '-'}")
     return "\n".join(parts)
 
 
 def _event_dedupe_key(ev: dict[str, Any]) -> str:
     """
-    Build a stable dedupe key. Prefer creation_ref when available and hash stable fields.
+    Build a dedupe key for notifications.
+
+    Prefer DGT identifiers to avoid re-notifying the same ongoing incident across
+    consecutive snapshots. Order:
+    1) sit:situation id
+    2) situationRecordCreationReference
+    3) situationRecord id
     """
+    situation_id = (ev.get("situation_id") or "").strip()
+    if situation_id:
+        return f"situation:{situation_id}"
+
     creation_ref = (ev.get("creation_ref") or "").strip()
-    base = creation_ref or (ev.get("situation_id") or "") or (ev.get("record_id") or "")
-    stable = "|".join(
-        [
-            base,
-            (ev.get("province") or ""),
-            (ev.get("municipality") or ""),
-            (ev.get("road") or ""),
-            (ev.get("km") or ""),
-            (ev.get("start_time") or ""),
-            (ev.get("lat") or ""),
-            (ev.get("lon") or ""),
-        ]
-    )
-    return hashlib.sha1(stable.encode("utf-8")).hexdigest()[:20]
+    if creation_ref:
+        return f"creation_ref:{creation_ref}"
+
+    record_id = (ev.get("record_id") or "").strip()
+    if record_id:
+        return f"record:{record_id}"
+
+    # Fallback: hash the whole event
+    return hashlib.sha1(json.dumps(ev, sort_keys=True).encode("utf-8")).hexdigest()[:20]
 
 
 def lambda_handler(event, context):
