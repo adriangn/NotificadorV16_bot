@@ -188,7 +188,7 @@ def _metrics_update_subscribed_chats(delta: int) -> None:
                 Key={"PK": "METRIC#subscriptions", "SK": "COUNTERS"},
                 UpdateExpression="ADD subscribed_chats :d SET updated_at = :now",
                 # Only decrement if the counter exists and is > 0 (avoid creating negative values).
-                ConditionExpression="subscribed_chats > :z",
+                ConditionExpression="attribute_exists(subscribed_chats) AND subscribed_chats > :z",
                 ExpressionAttributeValues={":d": delta, ":now": now, ":z": 0},
             )
         else:
@@ -197,7 +197,26 @@ def _metrics_update_subscribed_chats(delta: int) -> None:
                 UpdateExpression="ADD subscribed_chats :d SET updated_at = :now",
                 ExpressionAttributeValues={":d": delta, ":now": now},
             )
-    except Exception:
+    except Exception as e:
+        # Best-effort metric; never break user flows.
+        # If we tried to decrement before the counter exists, initialize it to 0 (best-effort)
+        # so dashboards don't show "missing" forever.
+        if delta < 0:
+            try:
+                code = e.response.get("Error", {}).get("Code")  # type: ignore[attr-defined]
+            except Exception:
+                code = None
+            if code == "ConditionalCheckFailedException":
+                try:
+                    table.update_item(
+                        Key={"PK": "METRIC#subscriptions", "SK": "COUNTERS"},
+                        UpdateExpression="SET subscribed_chats = :z, updated_at = :now",
+                        ConditionExpression="attribute_not_exists(subscribed_chats)",
+                        ExpressionAttributeValues={":z": 0, ":now": now},
+                    )
+                except Exception:
+                    pass
+                return
         # Best-effort metric; never break user flows.
         return
 
