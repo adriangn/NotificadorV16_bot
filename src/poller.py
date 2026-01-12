@@ -142,15 +142,46 @@ MUNPROV_TO_ID: dict[tuple[str, str], str] = {}
 # Maps municipality_normalized -> [municipality_id, ...] (fallback if province mismatch)
 MUN_TO_IDS: dict[str, list[str]] = {}
 
+def _split_slash_aliases(raw: str) -> list[str]:
+    """
+    INE dataset sometimes stores bilingual names joined by '/', e.g.
+    'Castelló de la Plana/Castellón de la Plana' or 'Castellón/Castelló'.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    return [p.strip() for p in raw.split("/") if p.strip()]
+
+
+def _dataset_norm_variants(raw: str, normalized: str) -> set[str]:
+    """
+    Build a set of normalized variants for a dataset field.
+    - Includes the provided normalized string (which may contain both sides of '/')
+    - Includes per-alias normalization for each side of '/'
+    """
+    out: set[str] = set()
+    n = (normalized or "").strip()
+    if n:
+        out.add(n)
+    for part in _split_slash_aliases(raw):
+        out.add(_normalize_text(part))
+    return {v for v in out if v}
+
 for m in MUNICIPALITIES:
     mid = m["id"]
-    mn = m.get("name_normalized", "") or _normalize_text(m.get("name", ""))
-    pn = m.get("province_name_normalized", "") or _normalize_text(m.get("province_name", ""))
-    for mnv in _article_variants(mn):
-        for pnv in _article_variants(pn):
-            if mnv and pnv:
-                MUNPROV_TO_ID[(mnv, pnv)] = mid
-        if mnv:
+    raw_name = m.get("name", "") or ""
+    raw_prov = m.get("province_name", "") or ""
+    mn0 = m.get("name_normalized", "") or _normalize_text(raw_name)
+    pn0 = m.get("province_name_normalized", "") or _normalize_text(raw_prov)
+
+    mn_set = _dataset_norm_variants(raw_name, mn0)
+    pn_set = _dataset_norm_variants(raw_prov, pn0)
+
+    for mn in mn_set:
+        for mnv in _article_variants(mn):
+            for pn in pn_set:
+                for pnv in _article_variants(pn):
+                    MUNPROV_TO_ID[(mnv, pnv)] = mid
             MUN_TO_IDS.setdefault(mnv, []).append(mid)
 
 
