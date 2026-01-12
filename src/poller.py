@@ -487,7 +487,7 @@ def _format_road_km(road: str, km: str) -> str:
     return ""
 
 
-def _acquire_poller_lock() -> bool:
+def _acquire_poller_lock(owner: str) -> bool:
     """
     Prevent overlapping poller runs without using ReservedConcurrentExecutions.
     Uses a DynamoDB conditional put with TTL.
@@ -501,7 +501,13 @@ def _acquire_poller_lock() -> bool:
         # item disappearing to consider the lock released. We allow acquiring the
         # lock if it doesn't exist OR it exists but its ttl has expired.
         table.put_item(
-            Item={"PK": pk, "SK": sk, "ttl": now + POLLER_LOCK_TTL_SECONDS, "created_at": now},
+            Item={
+                "PK": pk,
+                "SK": sk,
+                "ttl": now + POLLER_LOCK_TTL_SECONDS,
+                "created_at": now,
+                "owner": owner,
+            },
             ConditionExpression="attribute_not_exists(PK) OR ttl < :now",
             ExpressionAttributeValues={":now": now},
         )
@@ -517,13 +523,19 @@ def _acquire_poller_lock() -> bool:
         return False
 
 
-def _release_poller_lock() -> None:
+def _release_poller_lock(owner: str) -> None:
     """
     Best-effort lock release. Not strictly required thanks to ttl-based acquisition,
     but helps reduce skipped runs when TTL deletion is delayed.
     """
     try:
-        _get_ops_table().delete_item(Key={"PK": "LOCK#PollerFunction", "SK": "RUN"})
+        # Only release if we still own the lock to avoid deleting a newer run's lock.
+        _get_ops_table().delete_item(
+            Key={"PK": "LOCK#PollerFunction", "SK": "RUN"},
+            ConditionExpression="#o = :owner",
+            ExpressionAttributeNames={"#o": "owner"},
+            ExpressionAttributeValues={":owner": owner},
+        )
     except Exception:
         return
 
@@ -597,7 +609,7 @@ def lambda_handler(event, context):
     lock_acquired = False
     try:
         run_id = f"{int(time.time())}-{random.randint(1000, 9999)}"
-        if not _acquire_poller_lock():
+        if not _acquire_poller_lock(run_id):
             _log("info", "poller_skip_lock_held", run_id=run_id)
             _emit_metrics(poller_lock_skipped=1)
             return {"ok": True, "skipped": True}
@@ -746,5 +758,5 @@ def lambda_handler(event, context):
         return {"ok": False}
     finally:
         if lock_acquired:
-            _release_poller_lock()
+            _release_poller_lock(run_id)
 
