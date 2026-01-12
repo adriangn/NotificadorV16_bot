@@ -172,6 +172,35 @@ def _log(level: str, message: str, **fields: Any) -> None:
         logger.info(json.dumps(line, ensure_ascii=False))
 
 
+def _metrics_update_subscribed_chats(delta: int) -> None:
+    """
+    Maintain a global counter of chats with >=1 subscription.
+    Stored in OpsTable:
+      PK = METRIC#subscriptions, SK = COUNTERS, subscribed_chats (N)
+    """
+    if delta == 0:
+        return
+    table = _get_ops_table()
+    now = int(time.time())
+    try:
+        if delta < 0:
+            table.update_item(
+                Key={"PK": "METRIC#subscriptions", "SK": "COUNTERS"},
+                UpdateExpression="ADD subscribed_chats :d SET updated_at = :now",
+                ConditionExpression="attribute_not_exists(subscribed_chats) OR subscribed_chats > :z",
+                ExpressionAttributeValues={":d": delta, ":now": now, ":z": 0},
+            )
+        else:
+            table.update_item(
+                Key={"PK": "METRIC#subscriptions", "SK": "COUNTERS"},
+                UpdateExpression="ADD subscribed_chats :d SET updated_at = :now",
+                ExpressionAttributeValues={":d": delta, ":now": now},
+            )
+    except Exception:
+        # Best-effort metric; never break user flows.
+        return
+
+
 def _extract_update_context(update: dict) -> dict[str, Any]:
     """
     Extract minimal, safe context from a Telegram update for logging/DLQ.
@@ -281,6 +310,9 @@ def _subscribe(chat_id: int, mun_id: str) -> tuple[bool, str]:
         # Only protect against duplicate subscription row (same PK+SK). Do NOT use PK-only,
         # because the partition contains other items (STATE/SETTINGS/etc.).
         table.put_item(Item=item, ConditionExpression="attribute_not_exists(SK)")
+        # Maintain global metric: "subscribed chats" increments when the chat gets its first subscription.
+        if current == 0:
+            _metrics_update_subscribed_chats(delta=1)
         return True, f"Suscrito a: {m.get('name')} ({m.get('province_name')})"
     except Exception as e:
         # Already subscribed
@@ -295,7 +327,15 @@ def _subscribe(chat_id: int, mun_id: str) -> tuple[bool, str]:
 
 def _unsubscribe(chat_id: int, mun_id: str) -> tuple[bool, str]:
     table = _get_ddb_table()
-    table.delete_item(Key={"PK": _pk_chat(chat_id), "SK": _sk_mun(mun_id)})
+    res = table.delete_item(Key={"PK": _pk_chat(chat_id), "SK": _sk_mun(mun_id)}, ReturnValues="ALL_OLD")
+    deleted = bool(res.get("Attributes"))
+
+    # Maintain global metric: decrement when the chat removes its last subscription.
+    if deleted:
+        remaining = _count_subscriptions(chat_id)
+        if remaining == 0:
+            _metrics_update_subscribed_chats(delta=-1)
+
     m = MUNICIPALITY_BY_ID.get(mun_id)
     if m:
         return True, f"Suscripción anulada: {m.get('name')} ({m.get('province_name')})"

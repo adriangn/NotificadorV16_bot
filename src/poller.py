@@ -207,6 +207,19 @@ def _put_poller_state(run_id: str, **state: Any) -> None:
     table.put_item(Item=item)
 
 
+def _get_subscribed_chats_metric() -> int | None:
+    """
+    Read global subscribed chat count from OpsTable.
+    """
+    try:
+        res = _get_ops_table().get_item(Key={"PK": "METRIC#subscriptions", "SK": "COUNTERS"})
+        item = res.get("Item") or {}
+        val = item.get("subscribed_chats")
+        return int(val) if val is not None else None
+    except Exception:
+        return None
+
+
 def _retry(fn, *, tries: int, base_delay: float, max_delay: float, jitter: float = 0.2):
     last = None
     for i in range(tries):
@@ -674,6 +687,7 @@ def lambda_handler(event, context):
                 _log("warning", "telegram_send_failed", run_id=run_id, chat_id=chat_id)
                 continue
 
+        subscribed_chats = _get_subscribed_chats_metric()
         _emit_metrics(
             events_parsed=parsed,
             events_mapped=mapped,
@@ -683,6 +697,7 @@ def lambda_handler(event, context):
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
             quiet_skipped=quiet_skipped,
+            **({"subscribed_chats": int(subscribed_chats)} if subscribed_chats is not None else {}),
         )
         _put_poller_state(
             run_id,
@@ -694,6 +709,7 @@ def lambda_handler(event, context):
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
             quiet_skipped=quiet_skipped,
+            subscribed_chats=subscribed_chats,
         )
 
         _log(
@@ -708,6 +724,7 @@ def lambda_handler(event, context):
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
             quiet_skipped=quiet_skipped,
+            subscribed_chats=subscribed_chats,
         )
 
         return {"ok": True, "sent": sent, "events": len(events)}
