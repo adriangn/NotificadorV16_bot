@@ -471,17 +471,38 @@ def _iter_v16_events(xml_bytes: bytes) -> Iterable[dict[str, Any]]:
 
 
 def _municipality_id_from_names(municipality: str, province: str) -> str | None:
-    mn = _normalize_text(municipality)
-    pn = _normalize_text(province)
+    def _split_aliases(raw: str) -> list[str]:
+        """
+        DGT sometimes provides bilingual names joined by '/', e.g. 'Castelló/Castellón'.
+        We try each side as an alternative.
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            return []
+        parts = [p.strip() for p in raw.split("/") if p.strip()]
+        # Keep original first (in case it's not really an alias separator).
+        out: list[str] = [raw]
+        for p in parts:
+            if p not in out:
+                out.append(p)
+        return out
 
-    for mnv in _article_variants(mn):
-        for pnv in _article_variants(pn):
+    mn_norms: set[str] = set()
+    pn_norms: set[str] = set()
+
+    for mraw in _split_aliases(municipality):
+        mn_norms.update(_article_variants(_normalize_text(mraw)))
+    for praw in _split_aliases(province):
+        pn_norms.update(_article_variants(_normalize_text(praw)))
+
+    for mnv in mn_norms:
+        for pnv in pn_norms:
             mid = MUNPROV_TO_ID.get((mnv, pnv))
             if mid:
                 return mid
 
     # Fallback: if province naming differs, use unique municipality match.
-    for mnv in _article_variants(mn):
+    for mnv in mn_norms:
         candidates = MUN_TO_IDS.get(mnv, [])
         if len(candidates) == 1:
             return candidates[0]
