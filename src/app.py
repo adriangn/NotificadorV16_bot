@@ -303,11 +303,14 @@ def _set_chat_settings(chat_id: int, updates: dict[str, Any]) -> None:
 
 def _fmt_quiet(settings: dict[str, Any]) -> str:
     enabled = bool(settings.get("quiet_enabled"))
+    mode = settings.get("quiet_mode") or "window"
     start = settings.get("quiet_start") or "22:00"
     end = settings.get("quiet_end") or "08:00"
     tz = settings.get("quiet_tz") or "Europe/Madrid"
     if not enabled:
         return "🔔 Silencio: desactivado"
+    if mode == "always":
+        return "⏸️ Silencio: activado (continuo)"
     return f"🔕 Silencio: activado ({start}–{end} {tz})"
 
 
@@ -317,10 +320,10 @@ def _send_quiet_menu(chat_id: int) -> None:
         "🔕 *Modo silencio*\n\n"
         f"{_fmt_quiet(settings)}\n\n"
         "Durante el horario de silencio, el sistema no enviará notificaciones a este chat.\n\n"
-        "Configurar:\n"
-        "`/silencio HH:MM HH:MM`  (ej: `/silencio 23:00 07:30`)\n"
-        "Desactivar:\n"
-        "`/silencio off`"
+        "Opciones:\n"
+        "- Silencio continuo (pausa): `/silencio on`\n"
+        "- Silencio por horario: `/silencio HH:MM HH:MM`  (ej: `/silencio 23:00 07:30`)\n"
+        "- Desactivar: `/silencio off`"
     )
     _telegram_api(
         "sendMessage",
@@ -330,7 +333,8 @@ def _send_quiet_menu(chat_id: int) -> None:
             "parse_mode": "Markdown",
             "reply_markup": _kbd(
                 [
-                    [{"text": "Activar (22:00–08:00)", "callback_data": "quiet:on"}],
+                    [{"text": "⏸️ Activar continuo", "callback_data": "quiet:always"}],
+                    [{"text": "🕘 Activar (22:00–08:00)", "callback_data": "quiet:on"}],
                     [{"text": "Desactivar", "callback_data": "quiet:off"}],
                 ]
             ),
@@ -501,11 +505,19 @@ def _handle_text_message(chat_id: int, text: str) -> None:
 
     if t.startswith("/silencio"):
         # /silencio off
+        # /silencio on   (continuous pause)
         # /silencio HH:MM HH:MM
         parts = t.split()
         if len(parts) == 2 and parts[1].lower() in ("off", "no", "false", "0"):
             _set_chat_settings(chat_id, {"quiet_enabled": False})
             _telegram_api("sendMessage", {"chat_id": chat_id, "text": "🔔 Modo silencio desactivado."})
+            return
+        if len(parts) == 2 and parts[1].lower() in ("on", "si", "sí", "true", "1", "always"):
+            _set_chat_settings(
+                chat_id,
+                {"quiet_enabled": True, "quiet_mode": "always", "quiet_tz": "Europe/Madrid"},
+            )
+            _telegram_api("sendMessage", {"chat_id": chat_id, "text": "⏸️ Modo silencio continuo activado (pausa)."})
             return
 
         if len(parts) == 3:
@@ -533,7 +545,13 @@ def _handle_text_message(chat_id: int, text: str) -> None:
 
             _set_chat_settings(
                 chat_id,
-                {"quiet_enabled": True, "quiet_start": start, "quiet_end": end, "quiet_tz": "Europe/Madrid"},
+                {
+                    "quiet_enabled": True,
+                    "quiet_mode": "window",
+                    "quiet_start": start,
+                    "quiet_end": end,
+                    "quiet_tz": "Europe/Madrid",
+                },
             )
             _telegram_api("sendMessage", {"chat_id": chat_id, "text": f"🔕 Modo silencio activado: {start}–{end} (hora local)."})
             return
@@ -624,8 +642,13 @@ def _handle_callback(update: dict) -> None:
         return
 
     if data == "quiet:on":
-        _set_chat_settings(chat_id, {"quiet_enabled": True, "quiet_start": "22:00", "quiet_end": "08:00", "quiet_tz": "Europe/Madrid"})
+        _set_chat_settings(chat_id, {"quiet_enabled": True, "quiet_mode": "window", "quiet_start": "22:00", "quiet_end": "08:00", "quiet_tz": "Europe/Madrid"})
         _telegram_api("sendMessage", {"chat_id": chat_id, "text": "🔕 Modo silencio activado: 22:00–08:00 (hora local)."})
+        return
+
+    if data == "quiet:always":
+        _set_chat_settings(chat_id, {"quiet_enabled": True, "quiet_mode": "always", "quiet_tz": "Europe/Madrid"})
+        _telegram_api("sendMessage", {"chat_id": chat_id, "text": "⏸️ Modo silencio continuo activado (pausa)."})
         return
 
     if data == "quiet:off":

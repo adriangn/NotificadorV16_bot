@@ -88,3 +88,7 @@ You can silence notifications for a chat during a time window (Europe/Madrid):
 - `/silencio off`
 
 Or use `/start` → "Silencio (horario)".
+
+You can also pause notifications indefinitely:
+
+- `/silencio on`

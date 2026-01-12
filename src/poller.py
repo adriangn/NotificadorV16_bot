@@ -353,6 +353,9 @@ def _parse_hhmm(value: str) -> tuple[int, int] | None:
 def _is_quiet_now(settings: dict[str, Any]) -> bool:
     if not settings.get("quiet_enabled"):
         return False
+    mode = settings.get("quiet_mode") or "window"
+    if mode == "always":
+        return True
     start = settings.get("quiet_start")  # "HH:MM"
     end = settings.get("quiet_end")      # "HH:MM"
     tz = settings.get("quiet_tz") or "Europe/Madrid"
