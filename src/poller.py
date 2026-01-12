@@ -182,7 +182,12 @@ for m in MUNICIPALITIES:
             for pn in pn_set:
                 for pnv in _article_variants(pn):
                     MUNPROV_TO_ID[(mnv, pnv)] = mid
-            MUN_TO_IDS.setdefault(mnv, []).append(mid)
+            # Add once per municipality variant (not once per province variant).
+            lst = MUN_TO_IDS.setdefault(mnv, [])
+            if not lst or lst[-1] != mid:
+                # Prevent duplicate IDs that would break the len(candidates)==1 fallback.
+                # (We keep ordering stable and avoid O(n) membership checks.)
+                lst.append(mid)
 
 
 def _telegram_api(method: str, payload: dict) -> dict:
