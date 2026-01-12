@@ -71,6 +71,16 @@ def _send_dlq(payload: dict[str, Any]) -> None:
         return
 
 
+def _log(level: str, message: str, **fields: Any) -> None:
+    line = {"msg": message, **fields}
+    if level == "error":
+        logger.error(json.dumps(line, ensure_ascii=False))
+    elif level == "warning":
+        logger.warning(json.dumps(line, ensure_ascii=False))
+    else:
+        logger.info(json.dumps(line, ensure_ascii=False))
+
+
 def _normalize_text(s: str) -> str:
     s = (s or "").strip().lower()
     s = unicodedata.normalize("NFKD", s)
@@ -519,14 +529,15 @@ def _event_dedupe_key(ev: dict[str, Any]) -> str:
 
 def lambda_handler(event, context):
     try:
+        run_id = f"{int(time.time())}-{random.randint(1000, 9999)}"
         if not _acquire_poller_lock():
-            logger.info("Skipping run: lock held")
+            _log("info", "poller_skip_lock_held", run_id=run_id)
             _emit_metrics(poller_lock_skipped=1)
             return {"ok": True, "skipped": True}
 
         xml_bytes = _fetch_dgt_xml()
         events = list(_iter_v16_events(xml_bytes))
-        logger.info("Fetched %d V16-like events", len(events))
+        _log("info", "poller_fetched", run_id=run_id, events=len(events))
 
         parsed = len(events)
         mapped = 0
@@ -561,12 +572,27 @@ def lambda_handler(event, context):
                         continue
                 except Exception:
                     ddb_errors += 1
+                    _log(
+                        "warning",
+                        "dedupe_mark_failed",
+                        run_id=run_id,
+                        dedupe_key=record_id,
+                        chat_id=chat_id,
+                        situation_id=ev.get("situation_id"),
+                    )
                     continue
                 try:
                     _telegram_send_message(chat_id, text)
                     sent += 1
                 except Exception:
                     telegram_errors += 1
+                    _log(
+                        "warning",
+                        "telegram_send_failed",
+                        run_id=run_id,
+                        chat_id=chat_id,
+                        situation_id=ev.get("situation_id"),
+                    )
                     # Don't abort the batch.
                     continue
 
@@ -580,10 +606,24 @@ def lambda_handler(event, context):
             quiet_skipped=quiet_skipped,
         )
 
+        _log(
+            "info",
+            "poller_summary",
+            run_id=run_id,
+            parsed=parsed,
+            mapped=mapped,
+            unmapped=unmapped,
+            sent=sent,
+            telegram_errors=telegram_errors,
+            ddb_errors=ddb_errors,
+            quiet_skipped=quiet_skipped,
+        )
+
         return {"ok": True, "sent": sent, "events": len(events)}
     except Exception:
         logger.exception("Poller error")
-        _send_dlq({"type": "poller_exception", "time": int(time.time()), "event": event})
+        # Best-effort DLQ capture: never include full XML or large payloads.
+        _send_dlq({"type": "poller_exception", "time": int(time.time())})
         _emit_metrics(poller_errors=1)
         return {"ok": False}
 

@@ -145,6 +145,40 @@ def _send_bot_dlq(payload: dict[str, Any]) -> None:
         return
 
 
+def _log(level: str, message: str, **fields: Any) -> None:
+    """
+    Structured logs (single line JSON) to simplify searching in CloudWatch Logs.
+    """
+    line = {"msg": message, **fields}
+    if level == "error":
+        logger.error(json.dumps(line, ensure_ascii=False))
+    elif level == "warning":
+        logger.warning(json.dumps(line, ensure_ascii=False))
+    else:
+        logger.info(json.dumps(line, ensure_ascii=False))
+
+
+def _extract_update_context(update: dict) -> dict[str, Any]:
+    """
+    Extract minimal, safe context from a Telegram update for logging/DLQ.
+    Never include tokens/headers.
+    """
+    out: dict[str, Any] = {"update_id": update.get("update_id")}
+    chat_id = _extract_chat_id(update)
+    if chat_id is not None:
+        out["chat_id"] = chat_id
+
+    if isinstance(update.get("message"), dict):
+        text = update["message"].get("text")
+        if isinstance(text, str):
+            out["text"] = text[:120]
+    if isinstance(update.get("callback_query"), dict):
+        data = update["callback_query"].get("data")
+        if isinstance(data, str):
+            out["callback_data"] = data[:120]
+    return out
+
+
 def _pk_chat(chat_id: int) -> str:
     return f"CHAT#{chat_id}"
 
@@ -693,20 +727,24 @@ def lambda_handler(event, context):
         provided = _get_header(headers, "X-Telegram-Bot-Api-Secret-Token")
 
         if not WEBHOOK_SECRET:
-            logger.error("Missing TELEGRAM_WEBHOOK_SECRET env var")
+            _log("error", "missing_webhook_secret_env")
             return _response(500, {"ok": False})
 
         # Constant-time compare to avoid leaking information via timing attacks.
         if not provided or not hmac.compare_digest(str(provided), str(WEBHOOK_SECRET)):
-            logger.warning("Forbidden: invalid webhook secret token")
+            # Avoid noisy logs; do not include provided token.
+            _log("warning", "forbidden_invalid_webhook_secret")
             return _response(403, {"ok": False})
 
         update = _parse_body(event)
-        logger.info("Received update keys=%s", list(update.keys()))
+        ctx = _extract_update_context(update)
+        _log("info", "update_received", keys=list(update.keys()), **ctx)
 
         # Callback queries (inline buttons)
         if update.get("callback_query"):
+            _log("info", "handle_callback_start", **ctx)
             _handle_callback(update)
+            _log("info", "handle_callback_done", **ctx)
             return _response(200, {"ok": True})
 
         chat_id = _extract_chat_id(update)
@@ -716,7 +754,9 @@ def lambda_handler(event, context):
         message = update.get("message") or {}
         text = message.get("text") if isinstance(message, dict) else None
         if isinstance(text, str):
+            _log("info", "handle_message_start", **ctx)
             _handle_text_message(chat_id, text)
+            _log("info", "handle_message_done", **ctx)
             return _response(200, {"ok": True})
 
         # Ignore non-text messages for now.
@@ -724,7 +764,15 @@ def lambda_handler(event, context):
 
     except Exception:
         logger.exception("Unhandled error")
-        _send_bot_dlq({"type": "bot_exception", "time": int(time.time()), "event": event})
+        # Best-effort DLQ capture: never send full API Gateway event (may include secret headers).
+        safe = {"type": "bot_exception", "time": int(time.time())}
+        try:
+            update = _parse_body(event)
+            safe.update(_extract_update_context(update))
+            safe["keys"] = list(update.keys()) if isinstance(update, dict) else None
+        except Exception:
+            safe["parse_error"] = True
+        _send_bot_dlq(safe)
         # Return 200 to avoid Telegram retry storms for transient errors;
         # logs will show the failure in CloudWatch.
         return _response(200, {"ok": False})
