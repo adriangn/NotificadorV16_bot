@@ -371,19 +371,8 @@ def _send_menu(chat_id: int) -> None:
 
 def _get_chat_settings(chat_id: int) -> dict[str, Any]:
     key = {"PK": _pk_chat(chat_id), "SK": "SETTINGS"}
-    try:
-        res = _get_ops_table().get_item(Key=key)
-        item = res.get("Item")
-        if item:
-            return item
-    except Exception:
-        pass
-    # fallback: older deployments stored settings in SubscriptionsTable
-    try:
-        res = _get_ddb_table().get_item(Key=key)
-        return res.get("Item") or {}
-    except Exception:
-        return {}
+    res = _get_ops_table().get_item(Key=key)
+    return res.get("Item") or {}
 
 
 def _set_chat_settings(chat_id: int, updates: dict[str, Any]) -> None:
@@ -398,12 +387,6 @@ def _set_chat_settings(chat_id: int, updates: dict[str, Any]) -> None:
         **updates,
     }
     table.put_item(Item=item)
-    # Migration/operational convenience: keep legacy SubscriptionsTable SETTINGS in sync
-    # so that operators don't see conflicting values across tables.
-    try:
-        _get_ddb_table().put_item(Item=item)
-    except Exception:
-        pass
 
 
 def _fmt_quiet(settings: dict[str, Any]) -> str:

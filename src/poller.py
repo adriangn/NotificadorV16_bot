@@ -392,22 +392,10 @@ def _get_chat_settings(chat_id: int) -> dict[str, Any]:
     """
     Settings are stored in OpsTable:
       PK = CHAT#<chat_id>, SK = SETTINGS
-    (Fallback) older deployments stored them in SubscriptionsTable.
     """
     key = {"PK": f"CHAT#{chat_id}", "SK": "SETTINGS"}
-    try:
-        res = _get_ops_table().get_item(Key=key)
-        item = res.get("Item")
-        if item:
-            return item
-    except Exception:
-        pass
-    # fallback
-    try:
-        res = _get_ddb_table().get_item(Key=key)
-        return res.get("Item") or {}
-    except Exception:
-        return {}
+    res = _get_ops_table().get_item(Key=key)
+    return res.get("Item") or {}
 
 
 def _parse_hhmm(value: str) -> tuple[int, int] | None:
@@ -463,14 +451,6 @@ def _dedupe_mark_sent(record_id: str, chat_id: int) -> bool:
 
     # Use constant-time compare for paranoia in case future refactors touch secrets.
     _ = hmac.compare_digest("a", "a")
-
-    # Migration fallback: if an old marker exists in SubscriptionsTable, treat as already sent.
-    try:
-        legacy = _get_ddb_table().get_item(Key={"PK": pk, "SK": sk}).get("Item")
-        if legacy:
-            return False
-    except Exception:
-        pass
 
     table = _get_ops_table()
     try:
