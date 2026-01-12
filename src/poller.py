@@ -190,6 +190,34 @@ def _emit_metrics(**values: int) -> None:
     # CloudWatch automatically extracts EMF metrics from logs.
     print(json.dumps(doc))
 
+def _metrics_update_subscribed_chats(delta: int) -> None:
+    """
+    Maintain a global counter of chats with >=1 subscription.
+    Stored in OpsTable:
+      PK = METRIC#subscriptions, SK = COUNTERS, subscribed_chats (N)
+    Best-effort (never breaks poller).
+    """
+    if delta == 0:
+        return
+    table = _get_ops_table()
+    now = int(time.time())
+    try:
+        if delta < 0:
+            table.update_item(
+                Key={"PK": "METRIC#subscriptions", "SK": "COUNTERS"},
+                UpdateExpression="ADD subscribed_chats :d SET updated_at = :now",
+                ConditionExpression="attribute_not_exists(subscribed_chats) OR subscribed_chats > :z",
+                ExpressionAttributeValues={":d": delta, ":now": now, ":z": 0},
+            )
+        else:
+            table.update_item(
+                Key={"PK": "METRIC#subscriptions", "SK": "COUNTERS"},
+                UpdateExpression="ADD subscribed_chats :d SET updated_at = :now",
+                ExpressionAttributeValues={":d": delta, ":now": now},
+            )
+    except Exception:
+        return
+
 
 def _put_poller_state(run_id: str, **state: Any) -> None:
     """
@@ -296,6 +324,56 @@ def _telegram_error_details(exc: Exception) -> dict[str, Any]:
     except Exception:
         pass
     return details
+
+def _is_permanent_telegram_chat_error(details: dict[str, Any]) -> bool:
+    """
+    Return True for failures that indicate the chat will never be deliverable
+    unless the user re-starts/unblocks the bot.
+    """
+    status = int(details.get("http_status") or 0)
+    body = (details.get("body") or "").lower()
+    if status == 403 and ("bot was blocked by the user" in body or "bot was kicked" in body):
+        return True
+    if status == 400 and ("chat not found" in body or "group chat was upgraded" in body):
+        return True
+    return False
+
+
+def _purge_chat_subscriptions(chat_id: int) -> int:
+    """
+    Delete all subscription rows for a chat (PK=CHAT#<id>, SK begins_with MUN#).
+    Returns number of deleted rows (best-effort).
+    """
+    table = _get_ddb_table()
+    from boto3.dynamodb.conditions import Key
+
+    deleted = 0
+    res = table.query(
+        KeyConditionExpression=Key("PK").eq(f"CHAT#{chat_id}") & Key("SK").begins_with("MUN#"),
+    )
+    items = res.get("Items") or []
+    if not items:
+        return 0
+    with table.batch_writer() as batch:
+        for it in items:
+            pk = it.get("PK")
+            sk = it.get("SK")
+            if isinstance(pk, str) and isinstance(sk, str):
+                batch.delete_item(Key={"PK": pk, "SK": sk})
+                deleted += 1
+    return deleted
+
+
+def _purge_chat_ops(chat_id: int) -> None:
+    """
+    Best-effort cleanup of OpsTable items for a chat (settings/state) to reduce noise.
+    """
+    try:
+        ops = _get_ops_table()
+        ops.delete_item(Key={"PK": f"CHAT#{chat_id}", "SK": "SETTINGS"})
+        ops.delete_item(Key={"PK": f"CHAT#{chat_id}", "SK": "STATE"})
+    except Exception:
+        return
 
 
 def _fetch_dgt_xml() -> bytes:
@@ -733,13 +811,23 @@ def lambda_handler(event, context):
                 sent += 1
             except Exception as e:
                 telegram_errors += 1
-                _log(
-                    "warning",
-                    "telegram_send_failed",
-                    run_id=run_id,
-                    chat_id=chat_id,
-                    **_telegram_error_details(e),
-                )
+                details = _telegram_error_details(e)
+                _log("warning", "telegram_send_failed", run_id=run_id, chat_id=chat_id, **details)
+                # If user blocked the bot (or chat is permanently invalid), stop retrying forever:
+                # remove subscriptions and (optionally) chat settings/state.
+                if _is_permanent_telegram_chat_error(details):
+                    deleted = _purge_chat_subscriptions(chat_id)
+                    if deleted > 0:
+                        _metrics_update_subscribed_chats(delta=-1)
+                    _purge_chat_ops(chat_id)
+                    _log(
+                        "info",
+                        "chat_purged_after_telegram_error",
+                        run_id=run_id,
+                        chat_id=chat_id,
+                        deleted_subscriptions=deleted,
+                        http_status=details.get("http_status"),
+                    )
                 continue
 
         subscribed_chats = _get_subscribed_chats_metric()
