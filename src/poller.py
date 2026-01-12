@@ -458,7 +458,8 @@ def _dedupe_mark_sent(record_id: str, chat_id: int) -> bool:
             Item={"PK": pk, "SK": sk, "ttl": now + NOTIFY_TTL_SECONDS, "created_at": now},
             # PutItem conditions are evaluated against the *existing item with the same (PK, SK)*.
             # Using SK here makes it explicit that the uniqueness is per (event, chat).
-            ConditionExpression="attribute_not_exists(SK)",
+            # Be explicit for composite keys: the marker is unique per (PK, SK).
+            ConditionExpression="attribute_not_exists(PK) AND attribute_not_exists(SK)",
         )
         return True
     except Exception as e:
