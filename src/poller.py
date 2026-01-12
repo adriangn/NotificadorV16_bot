@@ -744,6 +744,7 @@ def lambda_handler(event, context):
         parsed = len(events)
         mapped = 0
         unmapped = 0
+        unmapped_samples: list[dict[str, Any]] = []
         sent = 0
         telegram_errors = 0
         ddb_errors = 0
@@ -755,6 +756,19 @@ def lambda_handler(event, context):
             mid = _municipality_id_from_names(ev["municipality"], ev["province"])
             if not mid:
                 unmapped += 1
+                if len(unmapped_samples) < 5:
+                    # Keep a small sample for manual debugging (avoid log spam).
+                    unmapped_samples.append(
+                        {
+                            "municipality": ev.get("municipality", ""),
+                            "province": ev.get("province", ""),
+                            "road": ev.get("road", ""),
+                            "km": ev.get("km", ""),
+                            "situation_id": ev.get("situation_id", ""),
+                            "record_id": ev.get("record_id", ""),
+                            "creation_ref": ev.get("creation_ref", ""),
+                        }
+                    )
                 continue
             mapped += 1
             chat_ids = _query_subscribed_chats(mid)
@@ -899,6 +913,15 @@ def lambda_handler(event, context):
             quiet_skipped=quiet_skipped,
             subscribed_chats=subscribed_chats,
         )
+
+        if unmapped_samples:
+            _log(
+                "info",
+                "events_unmapped_sample",
+                run_id=run_id,
+                count=unmapped,
+                sample=unmapped_samples,
+            )
 
         return {"ok": True, "sent": sent, "events": len(events)}
     except Exception:
