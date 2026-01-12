@@ -1,63 +1,63 @@
-# Privacy Policy (NotificadorV16_bot)
+# Política de privacidad (NotificadorV16_bot)
 
-**Last updated:** 2026-01-12
+**Última actualización:** 12/01/2026
 
-## 1) Controller
+## 1) Responsable
 
-This bot (“NotificadorV16_bot”) allows Telegram chats to manage municipality subscriptions and receive notifications about active V16 beacons based on public information published by the Spanish traffic authority (DGT).
+Este bot (“NotificadorV16_bot”) permite a chats de Telegram gestionar suscripciones por municipio y recibir notificaciones sobre balizas V16 activas en base a información pública publicada por la Dirección General de Tráfico (DGT).
 
-## 2) Data we process
+## 2) Datos que tratamos
 
-To provide the service, the bot may process:
+Para prestar el servicio, el bot puede tratar:
 
-- **Telegram chat identifier (`chat_id`)**: required to store subscriptions and send messages.
-- **Subscriptions**: the municipalities a chat is subscribed to.
-- **Preferences**: “quiet mode” settings (time window or continuous pause).
-- **Technical data**: operational logs and metrics related to service reliability and security (e.g., errors, counters).
+- **Identificador del chat de Telegram (`chat_id`)**: necesario para guardar suscripciones y enviar mensajes.
+- **Suscripciones**: municipios a los que el chat está suscrito.
+- **Preferencias**: configuración de “modo silencio” (por horario o pausa continua).
+- **Datos técnicos**: logs y métricas operativas relacionadas con la fiabilidad y la seguridad del servicio (por ejemplo, errores y contadores).
 
-The bot does **not** request or need your name, phone number, email, precise device location, or the content of your conversations, beyond the commands/messages needed to operate the service.
+El bot **no** solicita ni necesita tu nombre, teléfono, email, ubicación precisa del dispositivo ni el contenido de tus conversaciones, más allá de los comandos/mensajes necesarios para operar el servicio.
 
-## 3) Purpose of processing
+## 3) Finalidad del tratamiento
 
-We process data only to:
+Tratamos los datos únicamente para:
 
-- Manage your **subscriptions**.
-- Apply your **preferences** (e.g., quiet mode).
-- Send you **service notifications**.
-- Maintain **security and reliability** (monitoring, troubleshooting, abuse prevention).
+- Gestionar tus **suscripciones**.
+- Aplicar tus **preferencias** (por ejemplo, modo silencio).
+- Enviarte **notificaciones** del servicio.
+- Mantener la **seguridad y la fiabilidad** (monitorización, resolución de incidencias y prevención de abuso).
 
-## 4) Legal basis
+## 4) Base legal
 
-The legal basis is your **consent** and the **legitimate interest** of providing the requested service and ensuring its security and operation.
+La base legal es tu **consentimiento** y el **interés legítimo** de prestar el servicio solicitado y garantizar su seguridad y operación.
 
-## 5) Data retention
+## 5) Conservación de datos
 
-- **Subscriptions and preferences** are kept while the chat uses the service or until you remove them.
-- **Logs** are retained for **90 days**.
-- Operational anti-duplication markers and other service data may have shorter retention windows (hours/days) to prevent repeated notifications and ensure continuity.
+- **Suscripciones y preferencias**: se conservan mientras el chat use el servicio o hasta que las elimines.
+- **Logs**: se conservan durante **90 días**.
+- Marcadores operativos anti-duplicado y otros datos del servicio pueden tener ventanas de retención más cortas (horas/días) para evitar notificaciones repetidas y asegurar la continuidad.
 
-## 6) Sharing and third parties
+## 6) Destinatarios y terceros
 
-- **Telegram**: as the messaging platform, it processes messages under its own policies.
-- **AWS (Amazon Web Services)**: infrastructure where the bot runs and stores operational data (e.g., database and logs).
-- Incident data is fetched from the **public DGT feed**.
+- **Telegram**: como plataforma de mensajería, procesa los mensajes conforme a sus propias políticas.
+- **AWS (Amazon Web Services)**: infraestructura donde el bot se ejecuta y almacena datos operativos (por ejemplo, base de datos y logs).
+- La información de incidencias se obtiene del **feed público de la DGT**.
 
-We do not sell personal data or share it with third parties for marketing purposes.
+No vendemos datos personales ni los compartimos con terceros con fines comerciales o de marketing.
 
-## 7) Security
+## 7) Seguridad
 
-We apply reasonable security measures (access controls, secret separation, webhook validation, and monitoring). However, no system is 100% secure.
+Aplicamos medidas razonables de seguridad (controles de acceso, separación de secretos, validación del webhook y monitorización). Aun así, ningún sistema es 100% seguro.
 
-## 8) Your rights and how to contact us
+## 8) Derechos y contacto
 
-You can:
+Puedes:
 
-- Remove subscriptions using the bot commands.
-- Request deletion of data associated with your chat (subscriptions and preferences).
+- Eliminar suscripciones usando los comandos del bot.
+- Solicitar la eliminación de los datos asociados a tu chat (suscripciones y preferencias).
 
-To do so, contact the bot maintainer and include your `chat_id`.
+Para ello, contacta con el mantenedor del bot e incluye tu `chat_id`.
 
-## 9) Changes to this policy
+## 9) Cambios en esta política
 
-We may update this policy to reflect technical or legal changes. The “Last updated” date indicates the current version.
+Podemos actualizar esta política para reflejar cambios técnicos o legales. La “Última actualización” indica la versión vigente.
 
