@@ -22,6 +22,7 @@ logger.setLevel(logging.INFO)
 TELEGRAM_API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 SUBSCRIPTIONS_TABLE = os.environ.get("SUBSCRIPTIONS_TABLE", "")
+POLLER_DLQ_URL = os.environ.get("POLLER_DLQ_URL", "")
 
 DGT_XML_URL = os.environ.get(
     "DGT_XML_URL",
@@ -56,6 +57,18 @@ def _get_ddb_table():
 
     _DDB_TABLE = boto3.resource("dynamodb").Table(SUBSCRIPTIONS_TABLE)
     return _DDB_TABLE
+
+
+def _send_dlq(payload: dict[str, Any]) -> None:
+    if not POLLER_DLQ_URL:
+        return
+    try:
+        import boto3
+
+        boto3.client("sqs").send_message(QueueUrl=POLLER_DLQ_URL, MessageBody=json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        # Best-effort only.
+        return
 
 
 def _normalize_text(s: str) -> str:
@@ -315,6 +328,52 @@ def _query_subscribed_chats(municipality_id: str) -> list[int]:
     return chat_ids
 
 
+def _get_chat_settings(chat_id: int) -> dict[str, Any]:
+    """
+    Settings are stored in SubscriptionsTable:
+      PK = CHAT#<chat_id>, SK = SETTINGS
+    """
+    table = _get_ddb_table()
+    res = table.get_item(Key={"PK": f"CHAT#{chat_id}", "SK": "SETTINGS"})
+    return res.get("Item") or {}
+
+
+def _parse_hhmm(value: str) -> tuple[int, int] | None:
+    try:
+        hh, mm = value.split(":", 1)
+        h = int(hh)
+        m = int(mm)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h, m
+    except Exception:
+        return None
+    return None
+
+
+def _is_quiet_now(settings: dict[str, Any]) -> bool:
+    if not settings.get("quiet_enabled"):
+        return False
+    start = settings.get("quiet_start")  # "HH:MM"
+    end = settings.get("quiet_end")      # "HH:MM"
+    tz = settings.get("quiet_tz") or "Europe/Madrid"
+    if not (isinstance(start, str) and isinstance(end, str)):
+        return False
+    s = _parse_hhmm(start)
+    e = _parse_hhmm(end)
+    if not s or not e:
+        return False
+    now = datetime.now(ZoneInfo(tz))
+    now_m = now.hour * 60 + now.minute
+    s_m = s[0] * 60 + s[1]
+    e_m = e[0] * 60 + e[1]
+    if s_m == e_m:
+        return True  # full-day silence
+    if s_m < e_m:
+        return s_m <= now_m < e_m
+    # spans midnight
+    return now_m >= s_m or now_m < e_m
+
+
 def _dedupe_mark_sent(record_id: str, chat_id: int) -> bool:
     """
     Return True if we should send (first time), False if already sent recently.
@@ -443,6 +502,7 @@ def lambda_handler(event, context):
         sent = 0
         telegram_errors = 0
         ddb_errors = 0
+        quiet_skipped = 0
 
         for ev in events:
             mid = _municipality_id_from_names(ev["municipality"], ev["province"])
@@ -456,6 +516,14 @@ def lambda_handler(event, context):
             text = _format_message(ev)
             record_id = _event_dedupe_key(ev)
             for chat_id in chat_ids:
+                try:
+                    settings = _get_chat_settings(chat_id)
+                    if _is_quiet_now(settings):
+                        quiet_skipped += 1
+                        continue
+                except Exception:
+                    # If settings read fails, default to sending (do not silently drop).
+                    pass
                 try:
                     if not _dedupe_mark_sent(record_id, chat_id):
                         continue
@@ -477,11 +545,13 @@ def lambda_handler(event, context):
             notifications_sent=sent,
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
+            quiet_skipped=quiet_skipped,
         )
 
         return {"ok": True, "sent": sent, "events": len(events)}
     except Exception:
         logger.exception("Poller error")
+        _send_dlq({"type": "poller_exception", "time": int(time.time()), "event": event})
         _emit_metrics(poller_errors=1)
         return {"ok": False}
 

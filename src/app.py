@@ -18,6 +18,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 SUBSCRIPTIONS_TABLE = os.environ.get("SUBSCRIPTIONS_TABLE", "")
 MAX_SUBSCRIPTIONS = int(os.environ.get("MAX_SUBSCRIPTIONS", "50"))
+BOT_DLQ_URL = os.environ.get("BOT_DLQ_URL", "")
 
 _DDB_TABLE = None
 
@@ -133,6 +134,17 @@ def _get_ddb_table():
     return _DDB_TABLE
 
 
+def _send_bot_dlq(payload: dict[str, Any]) -> None:
+    if not BOT_DLQ_URL:
+        return
+    try:
+        import boto3
+
+        boto3.client("sqs").send_message(QueueUrl=BOT_DLQ_URL, MessageBody=json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        return
+
+
 def _pk_chat(chat_id: int) -> str:
     return f"CHAT#{chat_id}"
 
@@ -218,7 +230,9 @@ def _subscribe(chat_id: int, mun_id: str) -> tuple[bool, str]:
     }
 
     try:
-        table.put_item(Item=item, ConditionExpression="attribute_not_exists(PK)")
+        # Only protect against duplicate subscription row (same PK+SK). Do NOT use PK-only,
+        # because the partition contains other items (STATE/SETTINGS/etc.).
+        table.put_item(Item=item, ConditionExpression="attribute_not_exists(SK)")
         return True, f"Suscrito a: {m.get('name')} ({m.get('province_name')})"
     except Exception as e:
         # Already subscribed
@@ -260,6 +274,64 @@ def _send_menu(chat_id: int) -> None:
                     [{"text": "➕ Suscribirme a un municipio", "callback_data": "m_sub"}],
                     [{"text": "📋 Ver mis suscripciones", "callback_data": "m_list"}],
                     [{"text": "➖ Anular una suscripción", "callback_data": "m_unsub"}],
+                    [{"text": "🔕 Silencio (horario)", "callback_data": "m_quiet"}],
+                ]
+            ),
+        },
+    )
+
+
+def _get_chat_settings(chat_id: int) -> dict[str, Any]:
+    table = _get_ddb_table()
+    res = table.get_item(Key={"PK": _pk_chat(chat_id), "SK": "SETTINGS"})
+    return res.get("Item") or {}
+
+
+def _set_chat_settings(chat_id: int, updates: dict[str, Any]) -> None:
+    table = _get_ddb_table()
+    current = _get_chat_settings(chat_id)
+    now = int(time.time())
+    item = {
+        "PK": _pk_chat(chat_id),
+        "SK": "SETTINGS",
+        "updated_at": now,
+        **current,
+        **updates,
+    }
+    table.put_item(Item=item)
+
+
+def _fmt_quiet(settings: dict[str, Any]) -> str:
+    enabled = bool(settings.get("quiet_enabled"))
+    start = settings.get("quiet_start") or "22:00"
+    end = settings.get("quiet_end") or "08:00"
+    tz = settings.get("quiet_tz") or "Europe/Madrid"
+    if not enabled:
+        return "🔔 Silencio: desactivado"
+    return f"🔕 Silencio: activado ({start}–{end} {tz})"
+
+
+def _send_quiet_menu(chat_id: int) -> None:
+    settings = _get_chat_settings(chat_id)
+    text = (
+        "🔕 *Modo silencio*\n\n"
+        f"{_fmt_quiet(settings)}\n\n"
+        "Durante el horario de silencio, el sistema no enviará notificaciones a este chat.\n\n"
+        "Configurar:\n"
+        "`/silencio HH:MM HH:MM`  (ej: `/silencio 23:00 07:30`)\n"
+        "Desactivar:\n"
+        "`/silencio off`"
+    )
+    _telegram_api(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "reply_markup": _kbd(
+                [
+                    [{"text": "Activar (22:00–08:00)", "callback_data": "quiet:on"}],
+                    [{"text": "Desactivar", "callback_data": "quiet:off"}],
                 ]
             ),
         },
@@ -405,6 +477,7 @@ def _handle_text_message(chat_id: int, text: str) -> None:
                     "- /mis_suscripciones — ver municipios de este chat\n"
                     "- /anular — eliminar una suscripción\n"
                     "- /cancelar — cancelar la operación actual\n\n"
+                    "- /silencio — configurar horario de silencio\n\n"
                     "Límite: *50 municipios por chat*."
                 ),
                 "parse_mode": "Markdown",
@@ -424,6 +497,48 @@ def _handle_text_message(chat_id: int, text: str) -> None:
     if t.startswith("/anular"):
         _clear_chat_state(chat_id)
         _send_unsubscribe_page(chat_id, page=0)
+        return
+
+    if t.startswith("/silencio"):
+        # /silencio off
+        # /silencio HH:MM HH:MM
+        parts = t.split()
+        if len(parts) == 2 and parts[1].lower() in ("off", "no", "false", "0"):
+            _set_chat_settings(chat_id, {"quiet_enabled": False})
+            _telegram_api("sendMessage", {"chat_id": chat_id, "text": "🔔 Modo silencio desactivado."})
+            return
+
+        if len(parts) == 3:
+            start = parts[1]
+            end = parts[2]
+
+            def _ok(v: str) -> bool:
+                try:
+                    hh, mm = v.split(":", 1)
+                    h = int(hh)
+                    m = int(mm)
+                    return 0 <= h <= 23 and 0 <= m <= 59
+                except Exception:
+                    return False
+
+            if not (_ok(start) and _ok(end)):
+                _telegram_api(
+                    "sendMessage",
+                    {
+                        "chat_id": chat_id,
+                        "text": "Formato: /silencio HH:MM HH:MM  (ej: /silencio 23:00 07:30) o /silencio off",
+                    },
+                )
+                return
+
+            _set_chat_settings(
+                chat_id,
+                {"quiet_enabled": True, "quiet_start": start, "quiet_end": end, "quiet_tz": "Europe/Madrid"},
+            )
+            _telegram_api("sendMessage", {"chat_id": chat_id, "text": f"🔕 Modo silencio activado: {start}–{end} (hora local)."})
+            return
+
+        _send_quiet_menu(chat_id)
         return
 
     # If we are in "subscribe_search" mode, treat any text as query.
@@ -504,6 +619,20 @@ def _handle_callback(update: dict) -> None:
         _telegram_api("sendMessage", {"chat_id": chat_id, "text": "Operación cancelada."})
         return
 
+    if data == "m_quiet":
+        _send_quiet_menu(chat_id)
+        return
+
+    if data == "quiet:on":
+        _set_chat_settings(chat_id, {"quiet_enabled": True, "quiet_start": "22:00", "quiet_end": "08:00", "quiet_tz": "Europe/Madrid"})
+        _telegram_api("sendMessage", {"chat_id": chat_id, "text": "🔕 Modo silencio activado: 22:00–08:00 (hora local)."})
+        return
+
+    if data == "quiet:off":
+        _set_chat_settings(chat_id, {"quiet_enabled": False})
+        _telegram_api("sendMessage", {"chat_id": chat_id, "text": "🔔 Modo silencio desactivado."})
+        return
+
     if data.startswith("listp:"):
         try:
             page = int(data.split(":", 1)[1])
@@ -572,6 +701,7 @@ def lambda_handler(event, context):
 
     except Exception:
         logger.exception("Unhandled error")
+        _send_bot_dlq({"type": "bot_exception", "time": int(time.time()), "event": event})
         # Return 200 to avoid Telegram retry storms for transient errors;
         # logs will show the failure in CloudWatch.
         return _response(200, {"ok": False})

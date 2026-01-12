@@ -61,3 +61,30 @@ It extracts V16-like records (GenericSituationRecord with `vehicleObstruction/ve
 ### Deduplication
 
 The same V16 beacon can appear in multiple consecutive XML snapshots. To avoid spamming, the poller stores a "sent" marker in DynamoDB per `(record_id, chat_id)` with a TTL (`NOTIFY_TTL_SECONDS`, default 24h).
+
+## Alerts and DLQ
+
+### Alerts (SNS + CloudWatch Alarms)
+
+The stack creates an SNS topic and a few CloudWatch alarms.
+
+- Output: `AlertsTopicArn`
+- You can subscribe your email/SMS/Slack integration to this topic.
+
+### Dead-letter queues (SQS)
+
+The stack creates two SQS queues:
+
+- `BotDlqQueueUrl`: webhook bot errors (best-effort capture)
+- `PollerDlqQueueUrl`: poller errors (best-effort capture)
+
+These queues retain messages for 14 days.
+
+## Quiet hours (silence)
+
+You can silence notifications for a chat during a time window (Europe/Madrid):
+
+- `/silencio 23:00 07:30`
+- `/silencio off`
+
+Or use `/start` → "Silencio (horario)".

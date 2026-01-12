@@ -23,11 +23,14 @@ Resources:
         - AWSLambdaBasicExecutionRole
         - DynamoDBCrudPolicy:
             TableName: !Ref SubscriptionsTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt BotDlqQueue.QueueName
       Environment:
         Variables:
           TELEGRAM_TOKEN: !Ref TelegramToken
           TELEGRAM_WEBHOOK_SECRET: !Ref TelegramWebhookSecret
           SUBSCRIPTIONS_TABLE: !Ref SubscriptionsTable
+          BOT_DLQ_URL: !Ref BotDlqQueue
       Events:
         Webhook:
           Type: HttpApi
@@ -46,6 +49,8 @@ Resources:
         - AWSLambdaBasicExecutionRole
         - DynamoDBCrudPolicy:
             TableName: !Ref SubscriptionsTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt PollerDlqQueue.QueueName
       Environment:
         Variables:
           TELEGRAM_TOKEN: !Ref TelegramToken
@@ -54,6 +59,7 @@ Resources:
           NOTIFY_TTL_SECONDS: "86400"
           METRICS_NAMESPACE: NotificadorV16Bot
           POLLER_LOCK_TTL_SECONDS: "55"
+          POLLER_DLQ_URL: !Ref PollerDlqQueue
       Events:
         EveryMinute:
           Type: Schedule
@@ -92,6 +98,111 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
+
+  BotDlqQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  PollerDlqQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+
+  PollerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Poller reported errors (custom EMF metric poller_errors).
+      Namespace: NotificadorV16Bot
+      MetricName: poller_errors
+      Dimensions:
+        - Name: Service
+          Value: PollerFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  PollerNoNotificationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Events parsed but no notifications sent (possible mapping/subscription issue).
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: mParsed
+          MetricStat:
+            Metric:
+              Namespace: NotificadorV16Bot
+              MetricName: events_parsed
+              Dimensions:
+                - Name: Service
+                  Value: PollerFunction
+            Period: 300
+            Stat: Sum
+          ReturnData: false
+        - Id: mSent
+          MetricStat:
+            Metric:
+              Namespace: NotificadorV16Bot
+              MetricName: notifications_sent
+              Dimensions:
+                - Name: Service
+                  Value: PollerFunction
+            Period: 300
+            Stat: Sum
+          ReturnData: false
+        - Id: e1
+          Expression: IF(mParsed>0 AND mSent==0, 1, 0)
+          Label: ParsedButNoSent
+          ReturnData: true
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  TelegramBotLambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: TelegramBotFunction Lambda Errors > 0.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TelegramBotFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  PollerLambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: PollerFunction Lambda Errors > 0.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PollerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
 
   LogRetentionFunction:
     Type: AWS::Serverless::Function
@@ -138,4 +249,16 @@ Outputs:
   SubscriptionsTableName:
     Description: DynamoDB table for chat subscriptions
     Value: !Ref SubscriptionsTable
+
+  AlertsTopicArn:
+    Description: SNS topic for alarms (subscribe your email/SMS/Slack to receive alerts)
+    Value: !Ref AlertsTopic
+
+  BotDlqQueueUrl:
+    Description: SQS DLQ for webhook bot errors
+    Value: !Ref BotDlqQueue
+
+  PollerDlqQueueUrl:
+    Description: SQS DLQ for poller errors
+    Value: !Ref PollerDlqQueue
 
