@@ -22,6 +22,7 @@ logger.setLevel(logging.INFO)
 TELEGRAM_API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 SUBSCRIPTIONS_TABLE = os.environ.get("SUBSCRIPTIONS_TABLE", "")
+OPS_TABLE = os.environ.get("OPS_TABLE", "")
 POLLER_DLQ_URL = os.environ.get("POLLER_DLQ_URL", "")
 
 DGT_XML_URL = os.environ.get(
@@ -45,6 +46,7 @@ NS = {
 
 
 _DDB_TABLE = None
+_OPS_TABLE = None
 
 
 def _get_ddb_table():
@@ -58,6 +60,17 @@ def _get_ddb_table():
     _DDB_TABLE = boto3.resource("dynamodb").Table(SUBSCRIPTIONS_TABLE)
     return _DDB_TABLE
 
+
+def _get_ops_table():
+    global _OPS_TABLE
+    if _OPS_TABLE is not None:
+        return _OPS_TABLE
+    if not OPS_TABLE:
+        raise RuntimeError("Missing OPS_TABLE env var")
+    import boto3
+
+    _OPS_TABLE = boto3.resource("dynamodb").Table(OPS_TABLE)
+    return _OPS_TABLE
 
 def _send_dlq(payload: dict[str, Any]) -> None:
     if not POLLER_DLQ_URL:
@@ -176,6 +189,22 @@ def _emit_metrics(**values: int) -> None:
     }
     # CloudWatch automatically extracts EMF metrics from logs.
     print(json.dumps(doc))
+
+
+def _put_poller_state(run_id: str, **state: Any) -> None:
+    """
+    Store poller last-run state in OpsTable for /estado and debugging.
+    """
+    table = _get_ops_table()
+    now = int(time.time())
+    item = {
+        "PK": "STATE#PollerFunction",
+        "SK": "CURRENT",
+        "run_id": run_id,
+        "updated_at": now,
+        **state,
+    }
+    table.put_item(Item=item)
 
 
 def _retry(fn, *, tries: int, base_delay: float, max_delay: float, jitter: float = 0.2):
@@ -348,12 +377,24 @@ def _query_subscribed_chats(municipality_id: str) -> list[int]:
 
 def _get_chat_settings(chat_id: int) -> dict[str, Any]:
     """
-    Settings are stored in SubscriptionsTable:
+    Settings are stored in OpsTable:
       PK = CHAT#<chat_id>, SK = SETTINGS
+    (Fallback) older deployments stored them in SubscriptionsTable.
     """
-    table = _get_ddb_table()
-    res = table.get_item(Key={"PK": f"CHAT#{chat_id}", "SK": "SETTINGS"})
-    return res.get("Item") or {}
+    key = {"PK": f"CHAT#{chat_id}", "SK": "SETTINGS"}
+    try:
+        res = _get_ops_table().get_item(Key=key)
+        item = res.get("Item")
+        if item:
+            return item
+    except Exception:
+        pass
+    # fallback
+    try:
+        res = _get_ddb_table().get_item(Key=key)
+        return res.get("Item") or {}
+    except Exception:
+        return {}
 
 
 def _parse_hhmm(value: str) -> tuple[int, int] | None:
@@ -402,7 +443,7 @@ def _dedupe_mark_sent(record_id: str, chat_id: int) -> bool:
     We store one item per (record_id, chat_id) with TTL so duplicates across
     consecutive XML fetches do not re-notify.
     """
-    table = _get_ddb_table()
+    # Dedupe markers belong to ops/state table.
     now = int(time.time())
     pk = f"EVENT#{record_id}"
     sk = f"CHAT#{chat_id}"
@@ -410,6 +451,15 @@ def _dedupe_mark_sent(record_id: str, chat_id: int) -> bool:
     # Use constant-time compare for paranoia in case future refactors touch secrets.
     _ = hmac.compare_digest("a", "a")
 
+    # Migration fallback: if an old marker exists in SubscriptionsTable, treat as already sent.
+    try:
+        legacy = _get_ddb_table().get_item(Key={"PK": pk, "SK": sk}).get("Item")
+        if legacy:
+            return False
+    except Exception:
+        pass
+
+    table = _get_ops_table()
     try:
         table.put_item(
             Item={"PK": pk, "SK": sk, "ttl": now + NOTIFY_TTL_SECONDS, "created_at": now},
@@ -434,7 +484,7 @@ def _acquire_poller_lock() -> bool:
     Prevent overlapping poller runs without using ReservedConcurrentExecutions.
     Uses a DynamoDB conditional put with TTL.
     """
-    table = _get_ddb_table()
+    table = _get_ops_table()
     now = int(time.time())
     pk = "LOCK#PollerFunction"
     sk = "RUN"
@@ -546,6 +596,8 @@ def lambda_handler(event, context):
         telegram_errors = 0
         ddb_errors = 0
         quiet_skipped = 0
+        unique_candidate_chats: set[int] = set()
+        to_notify: dict[int, list[dict[str, Any]]] = {}
 
         for ev in events:
             mid = _municipality_id_from_names(ev["municipality"], ev["province"])
@@ -556,7 +608,8 @@ def lambda_handler(event, context):
             chat_ids = _query_subscribed_chats(mid)
             if not chat_ids:
                 continue
-            text = _format_message(ev)
+            for cid in chat_ids:
+                unique_candidate_chats.add(cid)
             record_id = _event_dedupe_key(ev)
             for chat_id in chat_ids:
                 try:
@@ -581,25 +634,62 @@ def lambda_handler(event, context):
                         situation_id=ev.get("situation_id"),
                     )
                     continue
-                try:
-                    _telegram_send_message(chat_id, text)
-                    sent += 1
-                except Exception:
-                    telegram_errors += 1
-                    _log(
-                        "warning",
-                        "telegram_send_failed",
-                        run_id=run_id,
-                        chat_id=chat_id,
-                        situation_id=ev.get("situation_id"),
-                    )
-                    # Don't abort the batch.
-                    continue
+                # Collect for batching per chat (grouping by situation within a single run).
+                to_notify.setdefault(chat_id, []).append(ev)
+
+        candidate_chats = len(unique_candidate_chats)
+
+        # Send notifications batched per chat
+        for chat_id, evs in to_notify.items():
+            if not evs:
+                continue
+            if len(evs) == 1:
+                msg = _format_message(evs[0])
+            else:
+                lines = [f"🚨 Baliza V16 activa ({len(evs)} nuevas)"]
+                for ev in evs[:10]:
+                    mun = ev.get("municipality", "")
+                    prov = ev.get("province", "")
+                    road = ev.get("road", "")
+                    km = ev.get("km", "")
+                    lat = (ev.get("lat", "") or "").strip()
+                    lon = (ev.get("lon", "") or "").strip()
+                    sid = (ev.get("situation_id") or "").strip()
+                    rid = (ev.get("record_id") or "").strip()
+                    where = f"{mun} ({prov})".strip()
+                    roadkm = f"{road} km {km}".strip()
+                    lines.append(f"- 📍 {where} — {roadkm}")
+                    if lat and lon:
+                        lines.append(f"  🗺️ https://www.google.com/maps?q={lat},{lon}")
+                    lines.append(f"  Ref. DGT: {sid or '-'} / {rid or '-'}")
+                if len(evs) > 10:
+                    lines.append(f"(+{len(evs)-10} más)")
+                msg = "\n".join(lines)
+
+            try:
+                _telegram_send_message(chat_id, msg)
+                sent += 1
+            except Exception:
+                telegram_errors += 1
+                _log("warning", "telegram_send_failed", run_id=run_id, chat_id=chat_id)
+                continue
 
         _emit_metrics(
             events_parsed=parsed,
             events_mapped=mapped,
             events_unmapped=unmapped,
+            notifications_sent=sent,
+            candidate_chats=candidate_chats,
+            telegram_errors=telegram_errors,
+            ddb_errors=ddb_errors,
+            quiet_skipped=quiet_skipped,
+        )
+        _put_poller_state(
+            run_id,
+            parsed=parsed,
+            mapped=mapped,
+            unmapped=unmapped,
+            candidate_chats=candidate_chats,
             notifications_sent=sent,
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
@@ -613,6 +703,7 @@ def lambda_handler(event, context):
             parsed=parsed,
             mapped=mapped,
             unmapped=unmapped,
+            candidate_chats=candidate_chats,
             sent=sent,
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,

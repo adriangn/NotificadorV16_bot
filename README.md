@@ -25,6 +25,7 @@ This repository expects the following GitHub Actions secrets to be configured:
 - `/suscribir`: Start municipality search flow.
 - `/mis_suscripciones`: List current chat subscriptions.
 - `/anular`: Unsubscribe flow (inline button selection).
+- `/estado`: Show poller status (last run summary).
 
 ## Data (municipalities)
 

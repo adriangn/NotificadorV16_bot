@@ -23,6 +23,8 @@ Resources:
         - AWSLambdaBasicExecutionRole
         - DynamoDBCrudPolicy:
             TableName: !Ref SubscriptionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OpsTable
         - SQSSendMessagePolicy:
             QueueName: !GetAtt BotDlqQueue.QueueName
       Environment:
@@ -30,6 +32,7 @@ Resources:
           TELEGRAM_TOKEN: !Ref TelegramToken
           TELEGRAM_WEBHOOK_SECRET: !Ref TelegramWebhookSecret
           SUBSCRIPTIONS_TABLE: !Ref SubscriptionsTable
+          OPS_TABLE: !Ref OpsTable
           BOT_DLQ_URL: !Ref BotDlqQueue
       Events:
         Webhook:
@@ -49,12 +52,15 @@ Resources:
         - AWSLambdaBasicExecutionRole
         - DynamoDBCrudPolicy:
             TableName: !Ref SubscriptionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OpsTable
         - SQSSendMessagePolicy:
             QueueName: !GetAtt PollerDlqQueue.QueueName
       Environment:
         Variables:
           TELEGRAM_TOKEN: !Ref TelegramToken
           SUBSCRIPTIONS_TABLE: !Ref SubscriptionsTable
+          OPS_TABLE: !Ref OpsTable
           DGT_XML_URL: https://nap.dgt.es/datex2/v3/dgt/SituationPublication/datex2_v36.xml
           NOTIFY_TTL_SECONDS: "86400"
           METRICS_NAMESPACE: NotificadorV16Bot
@@ -95,6 +101,24 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: KEYS_ONLY
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  OpsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
@@ -150,6 +174,17 @@ Resources:
             Period: 300
             Stat: Sum
           ReturnData: false
+        - Id: mCand
+          MetricStat:
+            Metric:
+              Namespace: NotificadorV16Bot
+              MetricName: candidate_chats
+              Dimensions:
+                - Name: Service
+                  Value: PollerFunction
+            Period: 300
+            Stat: Sum
+          ReturnData: false
         - Id: mSent
           MetricStat:
             Metric:
@@ -162,7 +197,7 @@ Resources:
             Stat: Sum
           ReturnData: false
         - Id: e1
-          Expression: IF(mParsed>0 AND mSent==0, 1, 0)
+          Expression: IF(mParsed>0 AND mCand>0 AND mSent==0, 1, 0)
           Label: ParsedButNoSent
           ReturnData: true
       AlarmActions:
@@ -249,6 +284,10 @@ Outputs:
   SubscriptionsTableName:
     Description: DynamoDB table for chat subscriptions
     Value: !Ref SubscriptionsTable
+
+  OpsTableName:
+    Description: DynamoDB table for ops/state/settings/dedupe
+    Value: !Ref OpsTable
 
   AlertsTopicArn:
     Description: SNS topic for alarms (subscribe your email/SMS/Slack to receive alerts)

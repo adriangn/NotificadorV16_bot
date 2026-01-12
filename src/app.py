@@ -17,10 +17,12 @@ TELEGRAM_API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.or
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 SUBSCRIPTIONS_TABLE = os.environ.get("SUBSCRIPTIONS_TABLE", "")
+OPS_TABLE = os.environ.get("OPS_TABLE", "")
 MAX_SUBSCRIPTIONS = int(os.environ.get("MAX_SUBSCRIPTIONS", "50"))
 BOT_DLQ_URL = os.environ.get("BOT_DLQ_URL", "")
 
 _DDB_TABLE = None
+_OPS_TABLE = None
 
 
 def _load_municipalities() -> list[dict[str, Any]]:
@@ -132,6 +134,18 @@ def _get_ddb_table():
 
     _DDB_TABLE = boto3.resource("dynamodb").Table(SUBSCRIPTIONS_TABLE)
     return _DDB_TABLE
+
+
+def _get_ops_table():
+    global _OPS_TABLE
+    if _OPS_TABLE is not None:
+        return _OPS_TABLE
+    if not OPS_TABLE:
+        raise RuntimeError("Missing OPS_TABLE env var")
+    import boto3
+
+    _OPS_TABLE = boto3.resource("dynamodb").Table(OPS_TABLE)
+    return _OPS_TABLE
 
 
 def _send_bot_dlq(payload: dict[str, Any]) -> None:
@@ -316,13 +330,24 @@ def _send_menu(chat_id: int) -> None:
 
 
 def _get_chat_settings(chat_id: int) -> dict[str, Any]:
-    table = _get_ddb_table()
-    res = table.get_item(Key={"PK": _pk_chat(chat_id), "SK": "SETTINGS"})
-    return res.get("Item") or {}
+    key = {"PK": _pk_chat(chat_id), "SK": "SETTINGS"}
+    try:
+        res = _get_ops_table().get_item(Key=key)
+        item = res.get("Item")
+        if item:
+            return item
+    except Exception:
+        pass
+    # fallback: older deployments stored settings in SubscriptionsTable
+    try:
+        res = _get_ddb_table().get_item(Key=key)
+        return res.get("Item") or {}
+    except Exception:
+        return {}
 
 
 def _set_chat_settings(chat_id: int, updates: dict[str, Any]) -> None:
-    table = _get_ddb_table()
+    table = _get_ops_table()
     current = _get_chat_settings(chat_id)
     now = int(time.time())
     item = {
@@ -516,6 +541,7 @@ def _handle_text_message(chat_id: int, text: str) -> None:
                     "- /anular — eliminar una suscripción\n"
                     "- /cancelar — cancelar la operación actual\n\n"
                     "- /silencio — configurar horario de silencio\n\n"
+                    "- /estado — ver estado del servicio\n\n"
                     "Límite: *50 municipios por chat*."
                 ),
                 "parse_mode": "Markdown",
@@ -591,6 +617,35 @@ def _handle_text_message(chat_id: int, text: str) -> None:
             return
 
         _send_quiet_menu(chat_id)
+        return
+
+    if t.startswith("/estado"):
+        try:
+            res = _get_ops_table().get_item(Key={"PK": "STATE#PollerFunction", "SK": "CURRENT"})
+            st = res.get("Item") or {}
+            if not st:
+                _telegram_api("sendMessage", {"chat_id": chat_id, "text": "Estado: sin datos todavía (el poller aún no ha guardado estado)."})
+                return
+            updated_at = st.get("updated_at")
+            run_id = st.get("run_id")
+            parsed = st.get("parsed")
+            mapped = st.get("mapped")
+            unmapped = st.get("unmapped")
+            cand = st.get("candidate_chats")
+            sent = st.get("notifications_sent")
+            quiet = st.get("quiet_skipped")
+            msg = (
+                "📡 *Estado del servicio*\n\n"
+                f"- Última ejecución: `{run_id}`\n"
+                f"- updated_at: `{updated_at}`\n"
+                f"- parsed/mapped/unmapped: `{parsed}` / `{mapped}` / `{unmapped}`\n"
+                f"- candidate_chats: `{cand}`\n"
+                f"- notifications_sent: `{sent}`\n"
+                f"- quiet_skipped: `{quiet}`\n"
+            )
+            _telegram_api("sendMessage", {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
+        except Exception:
+            _telegram_api("sendMessage", {"chat_id": chat_id, "text": "Estado: error leyendo el estado. Reintenta más tarde."})
         return
 
     # If we are in "subscribe_search" mode, treat any text as query.
