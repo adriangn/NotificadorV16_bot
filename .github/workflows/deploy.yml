@@ -33,7 +33,7 @@ jobs:
           version: "1.118.0"
 
       - name: Build
-        run: sam build --use-container
+        run: sam build
 
       - name: Deploy
         run: >
