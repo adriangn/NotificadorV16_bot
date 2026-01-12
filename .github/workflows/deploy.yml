@@ -33,7 +33,17 @@ jobs:
           version: "1.118.0"
 
       - name: Build
-        run: sam build
+        run: |
+          set -euo pipefail
+          # If we have dependencies, use a container so native wheels match the target Lambda architecture (arm64).
+          # If requirements are empty, a non-container build is much faster and safe (pure source copy).
+          if [ -f src/requirements.txt ] && [ -n "$(grep -Ev '^\s*#|^\s*$' src/requirements.txt || true)" ]; then
+            echo "requirements.txt not empty -> sam build --use-container"
+            sam build --use-container
+          else
+            echo "requirements.txt empty -> sam build (no container)"
+            sam build
+          fi
 
       - name: Deploy
         run: >
