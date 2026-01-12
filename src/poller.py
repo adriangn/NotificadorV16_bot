@@ -189,7 +189,15 @@ def _telegram_send_message(chat_id: int, text: str) -> None:
     """
 
     def _do():
-        return _telegram_api("sendMessage", {"chat_id": chat_id, "text": text})
+        return _telegram_api(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            },
+        )
 
     def _wrapped():
         try:
@@ -446,30 +454,40 @@ def _format_message(ev: dict[str, Any]) -> str:
     start_time = ev.get("start_time", "")
     lat = (ev.get("lat", "") or "").strip()
     lon = (ev.get("lon", "") or "").strip()
+    # Compact location line: municipality + road/km when available
+    loc = ""
     if mun or prov:
-        parts.append(f"📍 {mun} ({prov})".strip())
+        loc = f"{mun} ({prov})".strip()
     if road and km:
-        parts.append(f"🛣️ {road} — km {km}")
+        suffix = f"{road} km {km}"
     elif road:
-        parts.append(f"🛣️ {road}")
+        suffix = f"{road}"
     elif km:
-        parts.append(f"📌 km {km}")
+        suffix = f"km {km}"
+    else:
+        suffix = ""
+    if loc and suffix:
+        parts.append(f"📍 {loc} — {suffix}")
+    elif loc:
+        parts.append(f"📍 {loc}")
+    elif suffix:
+        parts.append(f"🛣️ {suffix}")
 
     if start_time:
         try:
             dt = datetime.fromisoformat(start_time.replace("Z", "+00:00")).astimezone(ZoneInfo("Europe/Madrid"))
-            parts.append(f"🕒 Desde: {dt.strftime('%d/%m/%Y %H:%M')} (hora local)")
+            parts.append(f"🕒 Activa desde: {dt.strftime('%d/%m/%Y %H:%M')} (hora local)")
         except Exception:
-            parts.append(f"🕒 Desde: {start_time}")
+            parts.append(f"🕒 Activa desde: {start_time}")
 
     if lat and lon:
-        parts.append(f"🗺️ Mapa: https://www.google.com/maps?q={lat},{lon}")
+        parts.append(f"🗺️ [Ver en el mapa](https://www.google.com/maps?q={lat},{lon})")
 
     # Traceability: helps understand whether repeated notifications are the same or different DGT records.
     sid = (ev.get("situation_id") or "").strip()
     rid = (ev.get("record_id") or "").strip()
     if sid or rid:
-        parts.append(f"🆔 DGT: situation={sid or '-'} record={rid or '-'}")
+        parts.append(f"Ref. DGT: {sid or '-'} / {rid or '-'}")
     return "\n".join(parts)
 
 
