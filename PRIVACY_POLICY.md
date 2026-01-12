@@ -48,6 +48,10 @@ No vendemos datos personales ni los compartimos con terceros con fines comercial
 
 Aplicamos medidas razonables de seguridad (controles de acceso, separación de secretos, validación del webhook y monitorización). Aun así, ningún sistema es 100% seguro.
 
+## 8) Servicio sin garantía
+
+El servicio se ofrece **“tal cual” (as-is)** y **sin ningún tipo de garantía**, expresa o implícita. No garantizamos la disponibilidad continua, la ausencia de errores, la exactitud, integridad o puntualidad de las notificaciones. El uso del bot es bajo tu propia responsabilidad.
+
 ## 8) Derechos y contacto
 
 Puedes:
@@ -57,7 +61,7 @@ Puedes:
 
 Para ello, contacta con el mantenedor del bot e incluye tu `chat_id`.
 
-## 9) Cambios en esta política
+## 10) Cambios en esta política
 
 Podemos actualizar esta política para reflejar cambios técnicos o legales. La “Última actualización” indica la versión vigente.
 
