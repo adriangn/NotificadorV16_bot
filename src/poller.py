@@ -532,7 +532,9 @@ def _acquire_poller_lock(owner: str) -> bool:
                 "created_at": now,
                 "owner": owner,
             },
-            ConditionExpression="attribute_not_exists(PK) OR ttl < :now",
+            # NOTE: "ttl" is a reserved keyword in DynamoDB expressions.
+            ConditionExpression="attribute_not_exists(PK) OR #ttl < :now",
+            ExpressionAttributeNames={"#ttl": "ttl"},
             ExpressionAttributeValues={":now": now},
         )
         return True
