@@ -456,7 +456,9 @@ def _dedupe_mark_sent(record_id: str, chat_id: int) -> bool:
     try:
         table.put_item(
             Item={"PK": pk, "SK": sk, "ttl": now + NOTIFY_TTL_SECONDS, "created_at": now},
-            ConditionExpression="attribute_not_exists(PK)",
+            # PutItem conditions are evaluated against the *existing item with the same (PK, SK)*.
+            # Using SK here makes it explicit that the uniqueness is per (event, chat).
+            ConditionExpression="attribute_not_exists(SK)",
         )
         return True
     except Exception as e:
@@ -472,6 +474,18 @@ def _dedupe_mark_sent(record_id: str, chat_id: int) -> bool:
         return False
 
 
+def _format_road_km(road: str, km: str) -> str:
+    road = (road or "").strip()
+    km = (km or "").strip()
+    if road and km:
+        return f"{road} km {km}"
+    if road:
+        return road
+    if km:
+        return f"km {km}"
+    return ""
+
+
 def _acquire_poller_lock() -> bool:
     """
     Prevent overlapping poller runs without using ReservedConcurrentExecutions.
@@ -482,9 +496,13 @@ def _acquire_poller_lock() -> bool:
     pk = "LOCK#PollerFunction"
     sk = "RUN"
     try:
+        # IMPORTANT: DynamoDB TTL expiry is asynchronous, so we must not rely on the
+        # item disappearing to consider the lock released. We allow acquiring the
+        # lock if it doesn't exist OR it exists but its ttl has expired.
         table.put_item(
             Item={"PK": pk, "SK": sk, "ttl": now + POLLER_LOCK_TTL_SECONDS, "created_at": now},
-            ConditionExpression="attribute_not_exists(PK)",
+            ConditionExpression="attribute_not_exists(PK) OR ttl < :now",
+            ExpressionAttributeValues={":now": now},
         )
         return True
     except Exception as e:
@@ -496,6 +514,17 @@ def _acquire_poller_lock() -> bool:
             return False
         logger.warning("Lock put failed: %s", e)
         return False
+
+
+def _release_poller_lock() -> None:
+    """
+    Best-effort lock release. Not strictly required thanks to ttl-based acquisition,
+    but helps reduce skipped runs when TTL deletion is delayed.
+    """
+    try:
+        _get_ops_table().delete_item(Key={"PK": "LOCK#PollerFunction", "SK": "RUN"})
+    except Exception:
+        return
 
 
 def _format_message(ev: dict[str, Any]) -> str:
@@ -511,14 +540,7 @@ def _format_message(ev: dict[str, Any]) -> str:
     loc = ""
     if mun or prov:
         loc = f"{mun} ({prov})".strip()
-    if road and km:
-        suffix = f"{road} km {km}"
-    elif road:
-        suffix = f"{road}"
-    elif km:
-        suffix = f"km {km}"
-    else:
-        suffix = ""
+    suffix = _format_road_km(road, km)
     if loc and suffix:
         parts.append(f"📍 {loc} — {suffix}")
     elif loc:
@@ -571,12 +593,14 @@ def _event_dedupe_key(ev: dict[str, Any]) -> str:
 
 
 def lambda_handler(event, context):
+    lock_acquired = False
     try:
         run_id = f"{int(time.time())}-{random.randint(1000, 9999)}"
         if not _acquire_poller_lock():
             _log("info", "poller_skip_lock_held", run_id=run_id)
             _emit_metrics(poller_lock_skipped=1)
             return {"ok": True, "skipped": True}
+        lock_acquired = True
 
         xml_bytes = _fetch_dgt_xml()
         events = list(_iter_v16_events(xml_bytes))
@@ -650,8 +674,13 @@ def lambda_handler(event, context):
                     sid = (ev.get("situation_id") or "").strip()
                     rid = (ev.get("record_id") or "").strip()
                     where = f"{mun} ({prov})".strip()
-                    roadkm = f"{road} km {km}".strip()
-                    lines.append(f"- 📍 {where} — {roadkm}")
+                    suffix = _format_road_km(road, km)
+                    if where and suffix:
+                        lines.append(f"- 📍 {where} — {suffix}")
+                    elif where:
+                        lines.append(f"- 📍 {where}")
+                    elif suffix:
+                        lines.append(f"- 🛣️ {suffix}")
                     if lat and lon:
                         lines.append(f"  🗺️ https://www.google.com/maps?q={lat},{lon}")
                     lines.append(f"  Ref. DGT: {sid or '-'} / {rid or '-'}")
@@ -714,4 +743,7 @@ def lambda_handler(event, context):
         _send_dlq({"type": "poller_exception", "time": int(time.time())})
         _emit_metrics(poller_errors=1)
         return {"ok": False}
+    finally:
+        if lock_acquired:
+            _release_poller_lock()
 

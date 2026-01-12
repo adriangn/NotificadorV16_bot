@@ -5,6 +5,8 @@ Description: Telegram bot on AWS Lambda (Webhook) - NotificadorV16_bot
 Globals:
   Function:
     Runtime: python3.12
+    Architectures:
+      - arm64
     Timeout: 10
     MemorySize: 128
     Tracing: Active
