@@ -274,6 +274,30 @@ def _telegram_send_message(chat_id: int, text: str) -> None:
     _retry(_wrapped, tries=3, base_delay=0.5, max_delay=3.0)
 
 
+def _telegram_error_details(exc: Exception) -> dict[str, Any]:
+    """
+    Return sanitized details useful for debugging Telegram API failures.
+    Do NOT include message text or full payloads.
+    """
+    details: dict[str, Any] = {"exc_type": type(exc).__name__}
+    try:
+        if isinstance(exc, urllib.error.HTTPError):
+            details["http_status"] = int(getattr(exc, "code", 0) or 0)
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            # Body typically contains {"ok":false,"error_code":403,"description":"..."}
+            if body:
+                details["body"] = body[:400]
+            ra = exc.headers.get("Retry-After") if getattr(exc, "headers", None) else None
+            if ra:
+                details["retry_after"] = ra
+    except Exception:
+        pass
+    return details
+
+
 def _fetch_dgt_xml() -> bytes:
     def _do():
         req = urllib.request.Request(DGT_XML_URL, method="GET")
@@ -668,6 +692,7 @@ def lambda_handler(event, context):
                 to_notify.setdefault(chat_id, []).append(ev)
 
         candidate_chats = len(unique_candidate_chats)
+        notify_targets = len(to_notify)  # chats with at least one pending event after quiet+dedupe
 
         # Send notifications batched per chat
         for chat_id, evs in to_notify.items():
@@ -704,9 +729,15 @@ def lambda_handler(event, context):
             try:
                 _telegram_send_message(chat_id, msg)
                 sent += 1
-            except Exception:
+            except Exception as e:
                 telegram_errors += 1
-                _log("warning", "telegram_send_failed", run_id=run_id, chat_id=chat_id)
+                _log(
+                    "warning",
+                    "telegram_send_failed",
+                    run_id=run_id,
+                    chat_id=chat_id,
+                    **_telegram_error_details(e),
+                )
                 continue
 
         subscribed_chats = _get_subscribed_chats_metric()
@@ -716,6 +747,7 @@ def lambda_handler(event, context):
             events_unmapped=unmapped,
             notifications_sent=sent,
             candidate_chats=candidate_chats,
+            notify_targets=notify_targets,
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
             quiet_skipped=quiet_skipped,
@@ -727,6 +759,7 @@ def lambda_handler(event, context):
             mapped=mapped,
             unmapped=unmapped,
             candidate_chats=candidate_chats,
+            notify_targets=notify_targets,
             notifications_sent=sent,
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
@@ -742,6 +775,7 @@ def lambda_handler(event, context):
             mapped=mapped,
             unmapped=unmapped,
             candidate_chats=candidate_chats,
+            notify_targets=notify_targets,
             sent=sent,
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
