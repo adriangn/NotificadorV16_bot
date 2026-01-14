@@ -1,2 +1,2 @@
-# No third-party dependencies required for the minimal webhook + sendMessage flow.
+pg8000==1.31.2
 
