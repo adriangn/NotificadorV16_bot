@@ -43,7 +43,6 @@ Resources:
             Path: /webhook
             Method: POST
 
-
   PollerFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -56,6 +55,8 @@ Resources:
             TableName: !Ref SubscriptionsTable
         - DynamoDBCrudPolicy:
             TableName: !Ref OpsTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref DsqlSecretArn
         - SQSSendMessagePolicy:
             QueueName: !GetAtt PollerDlqQueue.QueueName
       Environment:
@@ -63,10 +64,12 @@ Resources:
           TELEGRAM_TOKEN: !Ref TelegramToken
           SUBSCRIPTIONS_TABLE: !Ref SubscriptionsTable
           OPS_TABLE: !Ref OpsTable
+          DSQL_SECRET_ARN: !Ref DsqlSecretArn
           DGT_XML_URL: https://nap.dgt.es/datex2/v3/dgt/SituationPublication/datex2_v36.xml
           NOTIFY_TTL_SECONDS: "86400"
           METRICS_NAMESPACE: NotificadorV16Bot
           POLLER_LOCK_TTL_SECONDS: "55"
+          HISTORY_CLOSE_MISSING_AFTER_SECONDS: "180"
           POLLER_DLQ_URL: !Ref PollerDlqQueue
       Events:
         EveryMinute:
@@ -277,6 +280,9 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Secret token used to validate X-Telegram-Bot-Api-Secret-Token header
+  DsqlSecretArn:
+    Type: String
+    Description: Secrets Manager ARN with Aurora DSQL connection JSON (host, port, dbname, username, password)
 
 Outputs:
   HttpApiUrl:

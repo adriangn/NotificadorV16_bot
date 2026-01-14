@@ -9,11 +9,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import hmac
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import hashlib
 import random
 import urllib.error
+import ssl
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -23,6 +24,7 @@ TELEGRAM_API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.or
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 SUBSCRIPTIONS_TABLE = os.environ.get("SUBSCRIPTIONS_TABLE", "")
 OPS_TABLE = os.environ.get("OPS_TABLE", "")
+DSQL_SECRET_ARN = os.environ.get("DSQL_SECRET_ARN", "")
 POLLER_DLQ_URL = os.environ.get("POLLER_DLQ_URL", "")
 
 DGT_XML_URL = os.environ.get(
@@ -34,6 +36,7 @@ DGT_XML_URL = os.environ.get(
 NOTIFY_TTL_SECONDS = int(os.environ.get("NOTIFY_TTL_SECONDS", str(60 * 60 * 24)))
 METRICS_NAMESPACE = os.environ.get("METRICS_NAMESPACE", "NotificadorV16Bot")
 POLLER_LOCK_TTL_SECONDS = int(os.environ.get("POLLER_LOCK_TTL_SECONDS", "55"))
+HISTORY_CLOSE_MISSING_AFTER_SECONDS = int(os.environ.get("HISTORY_CLOSE_MISSING_AFTER_SECONDS", "180"))
 
 
 NS = {
@@ -47,6 +50,10 @@ NS = {
 
 _DDB_TABLE = None
 _OPS_TABLE = None
+_DSQL_CONN = None
+
+_OPEN_EVENTS_PK = "OPEN#V16"
+_OPEN_EVENTS_TTL_SECONDS = 7 * 24 * 60 * 60  # safety net if cleanup fails
 
 
 def _get_ddb_table():
@@ -71,6 +78,67 @@ def _get_ops_table():
 
     _OPS_TABLE = boto3.resource("dynamodb").Table(OPS_TABLE)
     return _OPS_TABLE
+
+
+def _load_dsql_secret() -> dict[str, Any]:
+    if not DSQL_SECRET_ARN:
+        raise RuntimeError("Missing DSQL_SECRET_ARN env var")
+    import boto3
+
+    sec = boto3.client("secretsmanager").get_secret_value(SecretId=DSQL_SECRET_ARN)
+    raw = sec.get("SecretString") or ""
+    if not raw:
+        raise RuntimeError("DSQL secret has empty SecretString")
+    data = json.loads(raw)
+    # Expected keys: host, port, dbname, username, password
+    return data
+
+
+def _get_dsql_conn():
+    """
+    Return a cached pg8000 connection to Aurora DSQL.
+    The secret must contain: host, port, dbname, username, password.
+    """
+    global _DSQL_CONN
+    if _DSQL_CONN is not None:
+        try:
+            cur = _DSQL_CONN.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            cur.close()
+            return _DSQL_CONN
+        except Exception:
+            try:
+                _DSQL_CONN.close()
+            except Exception:
+                pass
+            _DSQL_CONN = None
+
+    cfg = _load_dsql_secret()
+    host = str(cfg.get("host") or "").strip()
+    port = int(cfg.get("port") or 5432)
+    dbname = str(cfg.get("dbname") or cfg.get("database") or "postgres").strip()
+    user = str(cfg.get("username") or cfg.get("user") or "").strip()
+    password = str(cfg.get("password") or "").strip()
+    if not (host and user and password):
+        raise RuntimeError("DSQL secret must include host, username, password (and optional dbname, port)")
+
+    import pg8000.dbapi
+
+    ssl_ctx = ssl.create_default_context()
+    _DSQL_CONN = pg8000.dbapi.connect(
+        host=host,
+        port=port,
+        database=dbname,
+        user=user,
+        password=password,
+        ssl_context=ssl_ctx,
+        timeout=5,
+    )
+    # Use autocommit to keep logic simple in Lambda.
+    _DSQL_CONN.autocommit = True
+    return _DSQL_CONN
+
 
 def _send_dlq(payload: dict[str, Any]) -> None:
     if not POLLER_DLQ_URL:
@@ -439,6 +507,379 @@ def _fetch_dgt_xml() -> bytes:
     return _retry(_do, tries=3, base_delay=0.8, max_delay=5.0)
 
 
+def _parse_iso_to_epoch(value: str) -> int | None:
+    """
+    Parse DATEX2 timestamps like 2026-01-13T12:34:56Z into epoch seconds.
+    Returns None if parsing fails.
+    """
+    v = (value or "").strip()
+    if not v:
+        return None
+    try:
+        return int(datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+
+
+def _open_marker_sk(incident_id: str) -> str:
+    return f"INCIDENT#{incident_id}"
+
+
+def _road_key_and_type(road_name: str) -> tuple[str, str, str | None]:
+    """
+    Derive:
+    - road_key: normalized identifier used for grouping/filtering (e.g. "a-4", "ap-7", "m-30")
+    - road_type: high-level category derived from prefix (e.g. "A", "AP", "N", "M", "C", ...)
+    - road_name_clean: cleaned original (optional)
+    """
+    raw = (road_name or "").strip()
+    if not raw:
+        return "unknown", "UNKNOWN", None
+    # Normalize spaces and common formatting.
+    s = " ".join(raw.split())
+    s_up = s.upper()
+    # Replace common separators so patterns become consistent.
+    s_up = s_up.replace("–", "-").replace("—", "-").replace("−", "-")
+
+    # Extract prefix letters + optional dash + digits.
+    # Examples: "AP-7", "A-4", "N-340", "M-30", "C-31"
+    import re
+
+    m = re.search(r"\b([A-Z]{1,3})\s*-\s*(\d{1,4})\b", s_up)
+    if m:
+        pref = m.group(1)
+        num = m.group(2)
+        road_key = f"{pref.lower()}-{num}"
+        return road_key, pref, s
+
+    # Sometimes road is like "A4" or "AP7"
+    m = re.search(r"\b([A-Z]{1,3})\s*(\d{1,4})\b", s_up)
+    if m:
+        pref = m.group(1)
+        num = m.group(2)
+        road_key = f"{pref.lower()}-{num}"
+        return road_key, pref, s
+
+    # Fallback: take leading letters as "type" and hash-ish key.
+    m = re.match(r"^\s*([A-Z]{1,4})\b", s_up)
+    if m:
+        pref = m.group(1)
+        return _normalize_text(s).replace(" ", "_")[:40] or "unknown", pref, s
+    return _normalize_text(s).replace(" ", "_")[:40] or "unknown", "UNKNOWN", s
+
+
+def _dsql_upsert_incident(
+    ev: dict[str, Any],
+    *,
+    incident_id: str,
+    municipality_id: str,
+    road_key: str,
+    road_type: str,
+    road_name_clean: str | None,
+    now: datetime,
+    status: str,
+    ended_at: datetime | None = None,
+    end_reason: str | None = None,
+) -> None:
+    """
+    Upsert the incident row (1 row per incident_id). Best-effort.
+    """
+    conn = _get_dsql_conn()
+    cur = conn.cursor()
+    try:
+        start_raw = (ev.get("start_time") or "").strip()
+        end_raw = (ev.get("end_time") or "").strip()
+        start_feed = None
+        end_feed = None
+        try:
+            if start_raw:
+                start_feed = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+        except Exception:
+            start_feed = None
+        try:
+            if end_raw:
+                end_feed = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+        except Exception:
+            end_feed = None
+
+        cur.execute(
+            """
+            INSERT INTO incidents (
+              incident_id,
+              dgt_situation_id, dgt_record_id, dgt_creation_ref,
+              municipality_id, municipality_name, province_name,
+              road_name, road_key, road_type, km, lat, lon,
+              status, validity_status,
+              start_time_feed, end_time_feed,
+              first_seen_at, last_seen_at,
+              ended_at, end_reason,
+              seen_count,
+              created_at, updated_at
+            ) VALUES (
+              %s,
+              %s, %s, %s,
+              %s, %s, %s,
+              %s, %s, %s, %s, %s, %s,
+              %s, %s,
+              %s, %s,
+              %s, %s,
+              %s, %s,
+              %s,
+              now(), now()
+            )
+            ON CONFLICT (incident_id) DO UPDATE SET
+              dgt_situation_id = COALESCE(EXCLUDED.dgt_situation_id, incidents.dgt_situation_id),
+              dgt_record_id = COALESCE(EXCLUDED.dgt_record_id, incidents.dgt_record_id),
+              dgt_creation_ref = COALESCE(EXCLUDED.dgt_creation_ref, incidents.dgt_creation_ref),
+              municipality_id = EXCLUDED.municipality_id,
+              municipality_name = EXCLUDED.municipality_name,
+              province_name = EXCLUDED.province_name,
+              road_name = COALESCE(EXCLUDED.road_name, incidents.road_name),
+              road_key = EXCLUDED.road_key,
+              road_type = EXCLUDED.road_type,
+              km = COALESCE(EXCLUDED.km, incidents.km),
+              lat = COALESCE(EXCLUDED.lat, incidents.lat),
+              lon = COALESCE(EXCLUDED.lon, incidents.lon),
+              validity_status = COALESCE(EXCLUDED.validity_status, incidents.validity_status),
+              start_time_feed = COALESCE(incidents.start_time_feed, EXCLUDED.start_time_feed),
+              end_time_feed = COALESCE(EXCLUDED.end_time_feed, incidents.end_time_feed),
+              first_seen_at = LEAST(incidents.first_seen_at, EXCLUDED.first_seen_at),
+              last_seen_at = EXCLUDED.last_seen_at,
+              ended_at = COALESCE(incidents.ended_at, EXCLUDED.ended_at),
+              end_reason = COALESCE(incidents.end_reason, EXCLUDED.end_reason),
+              status = CASE
+                WHEN incidents.status = 'ended' THEN 'ended'
+                ELSE EXCLUDED.status
+              END,
+              seen_count = incidents.seen_count + 1,
+              updated_at = now()
+            """,
+            (
+                incident_id,
+                (ev.get("situation_id") or "").strip() or None,
+                (ev.get("record_id") or "").strip() or None,
+                (ev.get("creation_ref") or "").strip() or None,
+                municipality_id,
+                (ev.get("municipality") or "").strip(),
+                (ev.get("province") or "").strip(),
+                road_name_clean,
+                road_key,
+                road_type,
+                (ev.get("km") or "").strip() or None,
+                float(ev.get("lat")) if str(ev.get("lat") or "").strip() else None,
+                float(ev.get("lon")) if str(ev.get("lon") or "").strip() else None,
+                status,
+                (ev.get("validity_status") or "").strip() or None,
+                start_feed,
+                end_feed,
+                now,
+                now,
+                ended_at,
+                end_reason,
+                1,
+            ),
+        )
+    finally:
+        cur.close()
+
+
+def _dsql_close_incident(*, incident_id: str, now: datetime, ended_at: datetime, reason: str) -> None:
+    """
+    Close an incident row without overwriting its existing metadata.
+    Best-effort: if the row doesn't exist yet, this becomes a no-op.
+    """
+    conn = _get_dsql_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE incidents
+            SET
+              status = 'ended',
+              ended_at = COALESCE(ended_at, %s),
+              end_reason = COALESCE(end_reason, %s),
+              last_seen_at = %s,
+              updated_at = now()
+            WHERE incident_id = %s
+            """,
+            (ended_at, (reason or "").strip()[:80] or None, now, incident_id),
+        )
+    finally:
+        cur.close()
+
+
+def _dsql_upsert_bucket_road(
+    *,
+    bucket_minute: datetime,
+    municipality_id: str,
+    road_key: str,
+    road_type: str,
+    road_name: str | None,
+    active_count: int,
+    new_count: int,
+    ended_count: int,
+) -> None:
+    conn = _get_dsql_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO minute_buckets_road (
+              municipality_id, road_key, bucket_minute,
+              road_type, road_name,
+              active_count, new_count, ended_count
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (municipality_id, road_key, bucket_minute) DO UPDATE SET
+              road_type = EXCLUDED.road_type,
+              road_name = COALESCE(EXCLUDED.road_name, minute_buckets_road.road_name),
+              active_count = EXCLUDED.active_count,
+              new_count = EXCLUDED.new_count,
+              ended_count = EXCLUDED.ended_count
+            """,
+            (municipality_id, road_key, bucket_minute, road_type, road_name, active_count, new_count, ended_count),
+        )
+    finally:
+        cur.close()
+
+
+def _dsql_upsert_bucket_type(
+    *,
+    bucket_minute: datetime,
+    municipality_id: str,
+    road_type: str,
+    active_count: int,
+    new_count: int,
+    ended_count: int,
+) -> None:
+    conn = _get_dsql_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO minute_buckets_type (
+              municipality_id, road_type, bucket_minute,
+              active_count, new_count, ended_count
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (municipality_id, road_type, bucket_minute) DO UPDATE SET
+              active_count = EXCLUDED.active_count,
+              new_count = EXCLUDED.new_count,
+              ended_count = EXCLUDED.ended_count
+            """,
+            (municipality_id, road_type, bucket_minute, active_count, new_count, ended_count),
+        )
+    finally:
+        cur.close()
+
+
+def _dsql_upsert_bucket_mun(
+    *,
+    bucket_minute: datetime,
+    municipality_id: str,
+    active_count: int,
+    new_count: int,
+    ended_count: int,
+) -> None:
+    conn = _get_dsql_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO minute_buckets_mun (
+              municipality_id, bucket_minute,
+              active_count, new_count, ended_count
+            ) VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (municipality_id, bucket_minute) DO UPDATE SET
+              active_count = EXCLUDED.active_count,
+              new_count = EXCLUDED.new_count,
+              ended_count = EXCLUDED.ended_count
+            """,
+            (municipality_id, bucket_minute, active_count, new_count, ended_count),
+        )
+    finally:
+        cur.close()
+
+
+def _open_marker_put_with_dims(
+    incident_id: str,
+    *,
+    now: int,
+    municipality_id: str,
+    road_key: str,
+    road_type: str,
+    road_name: str | None,
+) -> None:
+    try:
+        _get_ops_table().put_item(
+            Item={
+                "PK": _OPEN_EVENTS_PK,
+                "SK": _open_marker_sk(incident_id),
+                "incident_id": incident_id,
+                "last_seen_at": now,
+                "created_at": now,
+                "municipality_id": municipality_id,
+                "road_key": road_key,
+                "road_type": road_type,
+                "road_name": road_name or "",
+                "ttl": now + _OPEN_EVENTS_TTL_SECONDS,
+            }
+        )
+    except Exception:
+        return
+
+
+def _open_marker_delete(incident_id: str) -> None:
+    try:
+        _get_ops_table().delete_item(Key={"PK": _OPEN_EVENTS_PK, "SK": _open_marker_sk(incident_id)})
+    except Exception:
+        return
+
+
+def _close_missing_open_incidents(*, seen_active: set[str], now: int) -> tuple[int, list[dict[str, Any]]]:
+    """
+    Close incidents that were open but are missing from the current feed for
+    HISTORY_CLOSE_MISSING_AFTER_SECONDS seconds.
+    Returns (closed_count, closed_items) (best-effort).
+    """
+    from boto3.dynamodb.conditions import Key
+
+    closed = 0
+    closed_items: list[dict[str, Any]] = []
+    try:
+        res = _get_ops_table().query(
+            KeyConditionExpression=Key("PK").eq(_OPEN_EVENTS_PK) & Key("SK").begins_with("INCIDENT#"),
+        )
+        items = res.get("Items") or []
+    except Exception:
+        return 0, []
+
+    for it in items:
+        sk = it.get("SK") or ""
+        if not isinstance(sk, str) or not sk.startswith("INCIDENT#"):
+            continue
+        incident_id = sk.split("#", 1)[1]
+        if incident_id in seen_active:
+            continue
+        try:
+            last_seen = int(it.get("last_seen_at") or 0)
+        except Exception:
+            last_seen = 0
+        if last_seen and (now - last_seen) < HISTORY_CLOSE_MISSING_AFTER_SECONDS:
+            continue
+        try:
+            _dsql_close_incident(
+                incident_id=incident_id,
+                now=datetime.fromtimestamp(now, tz=timezone.utc),
+                ended_at=datetime.fromtimestamp(now, tz=timezone.utc),
+                reason="missing_from_feed",
+            )
+        except Exception:
+            pass
+        closed_items.append(it)
+        _open_marker_delete(incident_id)
+        closed += 1
+    return closed, closed_items
+
+
 def _iter_v16_events(xml_bytes: bytes) -> Iterable[dict[str, Any]]:
     """
     Yield events that match the V16-like format shown by the user.
@@ -454,8 +895,6 @@ def _iter_v16_events(xml_bytes: bytes) -> Iterable[dict[str, Any]]:
             continue
 
         validity_status = rec.findtext("./sit:validity/com:validityStatus", default="", namespaces=NS)
-        if validity_status != "active":
-            continue
 
         cause_type = rec.findtext("./sit:cause/sit:causeType", default="", namespaces=NS)
         vehicle_type = rec.findtext(
@@ -486,6 +925,7 @@ def _iter_v16_events(xml_bytes: bytes) -> Iterable[dict[str, Any]]:
             ".//loc:extendedTpegNonJunctionPoint/lse:kilometerPoint", default="", namespaces=NS
         )
         start_time = rec.findtext("./sit:validity/com:validityTimeSpecification/com:overallStartTime", default="", namespaces=NS)
+        end_time = rec.findtext("./sit:validity/com:validityTimeSpecification/com:overallEndTime", default="", namespaces=NS)
         creation_ref = rec.findtext("./sit:situationRecordCreationReference", default="", namespaces=NS)
 
         record_id = rec.attrib.get("id") or situation_id or ""
@@ -496,11 +936,13 @@ def _iter_v16_events(xml_bytes: bytes) -> Iterable[dict[str, Any]]:
             "record_id": record_id,
             "situation_id": situation_id or "",
             "creation_ref": creation_ref,
+            "validity_status": validity_status,
             "municipality": municipality,
             "province": province,
             "road": road,
             "km": km,
             "start_time": start_time,
+            "end_time": end_time,
             "lat": lat,
             "lon": lon,
         }
@@ -795,6 +1237,9 @@ def lambda_handler(event, context):
         lock_acquired = True
 
         start_ts = time.time()
+        now = int(time.time())
+        now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+        bucket_minute = now_dt.replace(second=0, microsecond=0)
         xml_bytes = _fetch_dgt_xml()
         events = list(_iter_v16_events(xml_bytes))
 
@@ -808,9 +1253,99 @@ def lambda_handler(event, context):
         quiet_skipped = 0
         unique_candidate_chats: set[int] = set()
         to_notify: dict[int, list[dict[str, Any]]] = {}
+        seen_active_incidents: set[str] = set()
+        new_incidents: set[str] = set()
+        ended_incidents: set[str] = set()
+
+        # Load currently open incidents index (best-effort).
+        open_by_id: dict[str, dict[str, Any]] = {}
+        try:
+            from boto3.dynamodb.conditions import Key
+
+            res = _get_ops_table().query(
+                KeyConditionExpression=Key("PK").eq(_OPEN_EVENTS_PK) & Key("SK").begins_with("INCIDENT#"),
+            )
+            for it in res.get("Items") or []:
+                sk = it.get("SK") or ""
+                if isinstance(sk, str) and sk.startswith("INCIDENT#"):
+                    iid = sk.split("#", 1)[1]
+                    open_by_id[iid] = it
+        except Exception:
+            open_by_id = {}
+
+        # Aggregations for buckets (current minute).
+        active_counts_road: dict[tuple[str, str], int] = {}
+        new_counts_road: dict[tuple[str, str], int] = {}
+        ended_counts_road: dict[tuple[str, str], int] = {}
+        road_meta: dict[tuple[str, str], tuple[str, str | None]] = {}
+        active_counts_type: dict[tuple[str, str], int] = {}
+        new_counts_type: dict[tuple[str, str], int] = {}
+        ended_counts_type: dict[tuple[str, str], int] = {}
+        active_counts_mun: dict[str, int] = {}
+        new_counts_mun: dict[str, int] = {}
+        ended_counts_mun: dict[str, int] = {}
 
         for ev in events:
+            incident_id = _event_dedupe_key(ev)
             mid = _municipality_id_from_names(ev["municipality"], ev["province"])
+            municipality_id = mid or "UNMAPPED"
+
+            road_key, road_type, road_name_clean = _road_key_and_type(ev.get("road", "") or "")
+
+            validity = (ev.get("validity_status") or "").strip()
+            if validity == "active":
+                seen_active_incidents.add(incident_id)
+                _open_marker_put_with_dims(
+                    incident_id,
+                    now=now,
+                    municipality_id=municipality_id,
+                    road_key=road_key,
+                    road_type=road_type,
+                    road_name=road_name_clean,
+                )
+                if incident_id not in open_by_id:
+                    new_incidents.add(incident_id)
+            else:
+                # Close immediately when feed marks it inactive (if an end time exists, prefer it).
+                end_ts = _parse_iso_to_epoch((ev.get("end_time") or "").strip())
+                try:
+                    end_dt = datetime.fromtimestamp(end_ts if end_ts is not None else now, tz=timezone.utc)
+                    _dsql_upsert_incident(
+                        ev,
+                        incident_id=incident_id,
+                        municipality_id=municipality_id,
+                        road_key=road_key,
+                        road_type=road_type,
+                        road_name_clean=road_name_clean,
+                        now=now_dt,
+                        status="ended",
+                        ended_at=end_dt,
+                        end_reason="validity_inactive",
+                    )
+                except Exception:
+                    pass
+                _open_marker_delete(incident_id)
+                ended_incidents.add(incident_id)
+
+            # Notifications are only for active incidents.
+            if validity != "active":
+                continue
+
+            # Persist incident snapshot/update in DSQL (best-effort; never blocks notifications).
+            try:
+                _dsql_upsert_incident(
+                    ev,
+                    incident_id=incident_id,
+                    municipality_id=municipality_id,
+                    road_key=road_key,
+                    road_type=road_type,
+                    road_name_clean=road_name_clean,
+                    now=now_dt,
+                    status="active",
+                )
+            except Exception as e:
+                _log("warning", "dsql_upsert_failed", run_id=run_id, incident_id=incident_id, exc_type=type(e).__name__)
+
             if not mid:
                 unmapped += 1
                 if len(unmapped_samples) < 5:
@@ -833,7 +1368,6 @@ def lambda_handler(event, context):
                 continue
             for cid in chat_ids:
                 unique_candidate_chats.add(cid)
-            record_id = _event_dedupe_key(ev)
             for chat_id in chat_ids:
                 try:
                     settings = _get_chat_settings(chat_id)
@@ -844,7 +1378,7 @@ def lambda_handler(event, context):
                     # If settings read fails, default to sending (do not silently drop).
                     pass
                 try:
-                    if not _dedupe_mark_sent(record_id, chat_id):
+                    if not _dedupe_mark_sent(incident_id, chat_id):
                         continue
                 except Exception:
                     ddb_errors += 1
@@ -852,13 +1386,101 @@ def lambda_handler(event, context):
                         "warning",
                         "dedupe_mark_failed",
                         run_id=run_id,
-                        dedupe_key=record_id,
+                        dedupe_key=incident_id,
                         chat_id=chat_id,
                         situation_id=ev.get("situation_id"),
                     )
                     continue
                 # Collect for batching per chat (grouping by situation within a single run).
                 to_notify.setdefault(chat_id, []).append(ev)
+
+            # Bucket aggregations for the current minute (active incidents).
+            k_road = (municipality_id, road_key)
+            active_counts_road[k_road] = active_counts_road.get(k_road, 0) + 1
+            road_meta[k_road] = (road_type, road_name_clean)
+            k_type = (municipality_id, road_type)
+            active_counts_type[k_type] = active_counts_type.get(k_type, 0) + 1
+            active_counts_mun[municipality_id] = active_counts_mun.get(municipality_id, 0) + 1
+
+            if incident_id in new_incidents:
+                new_counts_road[k_road] = new_counts_road.get(k_road, 0) + 1
+                new_counts_type[k_type] = new_counts_type.get(k_type, 0) + 1
+                new_counts_mun[municipality_id] = new_counts_mun.get(municipality_id, 0) + 1
+
+        # Close incidents that were previously active but are now missing from the feed.
+        missing_closed, missing_closed_items = _close_missing_open_incidents(seen_active=seen_active_incidents, now=now)
+
+        # Compute ended buckets from ended incidents (validity inactive) and missing-closed.
+        # For missing-closed and inactive events, dimensions are retrieved from the open index when possible.
+        for iid in ended_incidents:
+            it = open_by_id.get(iid) or {}
+            mun_id = str(it.get("municipality_id") or "UNMAPPED")
+            rkey = str(it.get("road_key") or "unknown")
+            rtype = str(it.get("road_type") or "UNKNOWN")
+            k_road = (mun_id, rkey)
+            ended_counts_road[k_road] = ended_counts_road.get(k_road, 0) + 1
+            if k_road not in road_meta:
+                road_meta[k_road] = (rtype, (str(it.get("road_name") or "") or None))
+            k_type = (mun_id, rtype)
+            ended_counts_type[k_type] = ended_counts_type.get(k_type, 0) + 1
+            ended_counts_mun[mun_id] = ended_counts_mun.get(mun_id, 0) + 1
+
+        for it in missing_closed_items:
+            sk = it.get("SK") or ""
+            if not isinstance(sk, str) or not sk.startswith("INCIDENT#"):
+                continue
+            mun_id = str(it.get("municipality_id") or "UNMAPPED")
+            rkey = str(it.get("road_key") or "unknown")
+            rtype = str(it.get("road_type") or "UNKNOWN")
+            k_road = (mun_id, rkey)
+            ended_counts_road[k_road] = ended_counts_road.get(k_road, 0) + 1
+            if k_road not in road_meta:
+                road_meta[k_road] = (rtype, (str(it.get("road_name") or "") or None))
+            k_type = (mun_id, rtype)
+            ended_counts_type[k_type] = ended_counts_type.get(k_type, 0) + 1
+            ended_counts_mun[mun_id] = ended_counts_mun.get(mun_id, 0) + 1
+
+        # Write minute buckets to DSQL (best-effort; do not break notifications).
+        try:
+            # Road buckets
+            keys_road = set(active_counts_road) | set(new_counts_road) | set(ended_counts_road)
+            for (mun_id, rkey) in keys_road:
+                rtype, rname = road_meta.get((mun_id, rkey), ("UNKNOWN", None))
+                _dsql_upsert_bucket_road(
+                    bucket_minute=bucket_minute,
+                    municipality_id=mun_id,
+                    road_key=rkey,
+                    road_type=rtype,
+                    road_name=rname,
+                    active_count=int(active_counts_road.get((mun_id, rkey), 0)),
+                    new_count=int(new_counts_road.get((mun_id, rkey), 0)),
+                    ended_count=int(ended_counts_road.get((mun_id, rkey), 0)),
+                )
+
+            # Road type buckets
+            keys_type = set(active_counts_type) | set(new_counts_type) | set(ended_counts_type)
+            for (mun_id, rtype) in keys_type:
+                _dsql_upsert_bucket_type(
+                    bucket_minute=bucket_minute,
+                    municipality_id=mun_id,
+                    road_type=rtype,
+                    active_count=int(active_counts_type.get((mun_id, rtype), 0)),
+                    new_count=int(new_counts_type.get((mun_id, rtype), 0)),
+                    ended_count=int(ended_counts_type.get((mun_id, rtype), 0)),
+                )
+
+            # Municipality buckets
+            keys_mun = set(active_counts_mun) | set(new_counts_mun) | set(ended_counts_mun)
+            for mun_id in keys_mun:
+                _dsql_upsert_bucket_mun(
+                    bucket_minute=bucket_minute,
+                    municipality_id=mun_id,
+                    active_count=int(active_counts_mun.get(mun_id, 0)),
+                    new_count=int(new_counts_mun.get(mun_id, 0)),
+                    ended_count=int(ended_counts_mun.get(mun_id, 0)),
+                )
+        except Exception as e:
+            _log("warning", "dsql_buckets_failed", run_id=run_id, exc_type=type(e).__name__)
 
         candidate_chats = len(unique_candidate_chats)
         notify_targets = len(to_notify)  # chats with at least one pending event after quiet+dedupe
@@ -937,6 +1559,7 @@ def lambda_handler(event, context):
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
             quiet_skipped=quiet_skipped,
+            history_missing_closed=missing_closed,
             **({"subscribed_chats": int(subscribed_chats)} if subscribed_chats is not None else {}),
         )
         _put_poller_state(
@@ -951,6 +1574,7 @@ def lambda_handler(event, context):
             telegram_errors=telegram_errors,
             ddb_errors=ddb_errors,
             quiet_skipped=quiet_skipped,
+            history_missing_closed=missing_closed,
             subscribed_chats=subscribed_chats,
         )
 

@@ -63,6 +63,23 @@ It extracts V16-like records (GenericSituationRecord with `vehicleObstruction/ve
 
 The same V16 beacon can appear in multiple consecutive XML snapshots. To avoid spamming, the poller stores a "sent" marker in DynamoDB per `(record_id, chat_id)` with a TTL (`NOTIFY_TTL_SECONDS`, default 24h).
 
+### History + real-time charts (Aurora DSQL)
+
+The poller can persist a **historical record** of V16-like incidents and also write **minute-level buckets** ready for real-time charts (filters by municipality + road + road type + date ranges).
+
+- **Storage**: Aurora DSQL (Postgres-compatible SQL).
+- **Schema**: `src/sql/schema.sql`
+  - `incidents`: 1 row per incident (`incident_id`) with fixed metadata as columns (municipality, province, road, road_type, lat/lon, start/end, first/last seen, etc.).
+  - `minute_buckets_*`: pre-aggregated per-minute metrics for fast chart queries:
+    - `minute_buckets_road` (municipality + road)
+    - `minute_buckets_type` (municipality + road_type)
+    - `minute_buckets_mun` (municipality only)
+- **Connection**: poller reads a Secrets Manager secret (`DSQL_SECRET_ARN`) containing JSON connection fields: `host`, `port`, `dbname`, `username`, `password`.
+- **Closing logic**:
+  - If the feed reports `validityStatus != active`, the incident is closed immediately (`end_reason=validity_inactive`).
+  - If an incident disappears from the feed, it is closed after `HISTORY_CLOSE_MISSING_AFTER_SECONDS` (default 180s) to avoid transient feed gaps (`end_reason=missing_from_feed`).
+- **Road type**: derived from the road name prefix (e.g. `AP`, `A`, `N`, `M`), stored as a dedicated column (`road_type`) so it can be indexed and filtered efficiently.
+
 ## Alerts and DLQ
 
 ### Alerts (SNS + CloudWatch Alarms)
