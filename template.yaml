@@ -65,6 +65,7 @@ Resources:
           OPS_TABLE: !Ref OpsTable
           DGT_XML_URL: https://nap.dgt.es/datex2/v3/dgt/SituationPublication/datex2_v36.xml
           NOTIFY_TTL_SECONDS: "86400"
+          HISTORY_TTL_SECONDS: "7776000"
           METRICS_NAMESPACE: NotificadorV16Bot
           POLLER_LOCK_TTL_SECONDS: "55"
           POLLER_DLQ_URL: !Ref PollerDlqQueue
