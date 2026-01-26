@@ -63,6 +63,16 @@ It extracts V16-like records (GenericSituationRecord with `vehicleObstruction/ve
 
 The same V16 beacon can appear in multiple consecutive XML snapshots. To avoid spamming, the poller stores a "sent" marker in DynamoDB per `(record_id, chat_id)` with a TTL (`NOTIFY_TTL_SECONDS`, default 24h).
 
+### History
+
+Each DGT event is stored as a compact history record in the OpsTable (keyed by a stable event identifier) with:
+
+- `first_seen_at`, `last_seen_at`, and `seen_count`
+- location metadata (municipality/province/road/km/coords)
+- DGT identifiers (`situation_id`, `record_id`, `creation_ref`)
+
+Retention is controlled by `HISTORY_TTL_SECONDS` (default 90 days).
+
 ## Alerts and DLQ
 
 ### Alerts (SNS + CloudWatch Alarms)

@@ -32,6 +32,7 @@ DGT_XML_URL = os.environ.get(
 
 # Dedup window: how long we keep "sent" markers (seconds).
 NOTIFY_TTL_SECONDS = int(os.environ.get("NOTIFY_TTL_SECONDS", str(60 * 60 * 24)))
+HISTORY_TTL_SECONDS = int(os.environ.get("HISTORY_TTL_SECONDS", str(60 * 60 * 24 * 90)))
 METRICS_NAMESPACE = os.environ.get("METRICS_NAMESPACE", "NotificadorV16Bot")
 POLLER_LOCK_TTL_SECONDS = int(os.environ.get("POLLER_LOCK_TTL_SECONDS", "55"))
 
@@ -784,6 +785,68 @@ def _event_dedupe_key(ev: dict[str, Any]) -> str:
     return hashlib.sha1(json.dumps(ev, sort_keys=True).encode("utf-8")).hexdigest()[:20]
 
 
+def _store_event_history(ev: dict[str, Any], municipality_id: str | None, history_id: str) -> None:
+    """
+    Store/refresh a compact history record for each DGT event.
+    """
+    table = _get_ops_table()
+    now = int(time.time())
+    expr_values: dict[str, Any] = {
+        ":now": now,
+        ":zero": 0,
+        ":one": 1,
+        ":municipality": ev.get("municipality", ""),
+        ":province": ev.get("province", ""),
+        ":road": ev.get("road", ""),
+        ":km": ev.get("km", ""),
+        ":start_time": ev.get("start_time", ""),
+        ":lat": ev.get("lat", ""),
+        ":lon": ev.get("lon", ""),
+        ":record_id": ev.get("record_id", ""),
+        ":situation_id": ev.get("situation_id", ""),
+        ":creation_ref": ev.get("creation_ref", ""),
+        ":municipality_id": municipality_id or "",
+        ":mapped": bool(municipality_id),
+        ":source": "dgt",
+        ":history_id": history_id,
+    }
+    update_expr = (
+        "SET "
+        "first_seen_at = if_not_exists(first_seen_at, :now), "
+        "last_seen_at = :now, "
+        "seen_count = if_not_exists(seen_count, :zero) + :one, "
+        "municipality = :municipality, "
+        "province = :province, "
+        "road = :road, "
+        "km = :km, "
+        "start_time = :start_time, "
+        "lat = :lat, "
+        "lon = :lon, "
+        "record_id = :record_id, "
+        "situation_id = :situation_id, "
+        "creation_ref = :creation_ref, "
+        "municipality_id = :municipality_id, "
+        "mapped = :mapped, "
+        "source = :source, "
+        "history_id = :history_id, "
+        "updated_at = :now"
+    )
+    expr_names: dict[str, str] = {}
+    if HISTORY_TTL_SECONDS > 0:
+        update_expr += ", #ttl = :ttl"
+        expr_values[":ttl"] = now + HISTORY_TTL_SECONDS
+        expr_names["#ttl"] = "ttl"
+
+    params: dict[str, Any] = {
+        "Key": {"PK": f"HISTORY#{history_id}", "SK": "SUMMARY"},
+        "UpdateExpression": update_expr,
+        "ExpressionAttributeValues": expr_values,
+    }
+    if expr_names:
+        params["ExpressionAttributeNames"] = expr_names
+    table.update_item(**params)
+
+
 def lambda_handler(event, context):
     lock_acquired = False
     try:
@@ -810,7 +873,19 @@ def lambda_handler(event, context):
         to_notify: dict[int, list[dict[str, Any]]] = {}
 
         for ev in events:
+            history_id = _event_dedupe_key(ev)
             mid = _municipality_id_from_names(ev["municipality"], ev["province"])
+            try:
+                _store_event_history(ev, mid, history_id)
+            except Exception:
+                ddb_errors += 1
+                _log(
+                    "warning",
+                    "history_store_failed",
+                    run_id=run_id,
+                    history_id=history_id,
+                    situation_id=ev.get("situation_id"),
+                )
             if not mid:
                 unmapped += 1
                 if len(unmapped_samples) < 5:
@@ -833,7 +908,7 @@ def lambda_handler(event, context):
                 continue
             for cid in chat_ids:
                 unique_candidate_chats.add(cid)
-            record_id = _event_dedupe_key(ev)
+            record_id = history_id
             for chat_id in chat_ids:
                 try:
                     settings = _get_chat_settings(chat_id)
